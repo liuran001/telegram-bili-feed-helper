@@ -1,9 +1,45 @@
-"""测试 channel/telegram/uploader.py — cleanup_medias、_get_constraints"""
+"""测试 channel/telegram/uploader.py — cleanup_medias、_get_constraints、split_long_image_bytes"""
 
 import tempfile
+from io import BytesIO
 from pathlib import Path
 
-from biliparser.channel.telegram.uploader import _get_constraints, cleanup_medias
+from PIL import Image
+
+from biliparser.channel.telegram.uploader import (
+    _get_constraints,
+    cleanup_medias,
+    split_long_image_bytes,
+)
+
+
+def _make_jpeg(w: int, h: int) -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", (w, h), (120, 80, 40)).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+def test_split_long_image_normal_returns_none():
+    """正常比例图不切割，返回 None"""
+    assert split_long_image_bytes(_make_jpeg(1080, 1080)) is None
+    assert split_long_image_bytes(_make_jpeg(1080, 1920)) is None
+
+
+def test_split_long_image_tall_splits_full_width():
+    """超长图按高度切片，每片保留原始宽度且符合 tdlib 约束(w+h<=10000)"""
+    pieces = split_long_image_bytes(_make_jpeg(1080, 15631), ratio=2, max_pieces=10)
+    assert pieces is not None and len(pieces) > 1
+    for pb in pieces:
+        with Image.open(BytesIO(pb)) as im:
+            w, h = im.size
+        assert w == 1080  # 全宽，非细条
+        assert w + h <= 10000  # tdlib photo 约束
+
+
+def test_split_long_image_respects_max_pieces():
+    """极端超长图切割片数不超过 max_pieces"""
+    pieces = split_long_image_bytes(_make_jpeg(1080, 25967), ratio=2, max_pieces=10)
+    assert pieces is not None and len(pieces) <= 10
 
 
 def test_cleanup_medias_paths():

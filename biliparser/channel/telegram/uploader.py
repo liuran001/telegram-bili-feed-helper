@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import re
 import subprocess
@@ -10,6 +11,7 @@ from uuid import uuid4
 
 import httpx
 from async_timeout import timeout
+from PIL import Image
 from telegram import InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
 from telegram.constants import ChatType
 from telegram.error import BadRequest, NetworkError, RetryAfter
@@ -23,6 +25,12 @@ from ...utils import compress, logger
 
 LOCAL_MEDIA_FILE_PATH = Path(os.environ.get("LOCAL_TEMP_FILE_PATH", str(Path.cwd()))) / ".tmp"
 LOCAL_MODE = bool(os.environ.get("LOCAL_MODE", False))
+
+# 超长图切割：高宽比超过该值则按高度切成多片，使每片接近此比例（默认 2，保证切片清晰可读）。
+# Telegram photo 限制 width+height<=10000，且过细长条会被本地 Bot API 判为 document。
+IMAGE_SPLIT_RATIO = float(os.environ.get("IMAGE_SPLIT_RATIO", 2))
+# 单条动态每张超长图切割后最多片数（Telegram media group 单组上限 10），防止极端长图刷屏
+IMAGE_SPLIT_MAX_PIECES = int(os.environ.get("IMAGE_SPLIT_MAX_PIECES", 10))
 
 BILIBILI_SHARE_URL_REGEX = r"(?i)【.*】 https://[\w\.]*?(?:bilibili\.com|b23\.tv|bili2?2?3?3?\.cn)\S+"
 
@@ -123,13 +131,26 @@ async def get_media(
                         pbar.update(len(chunk))
             elif media_check_ignore or mediatype[0] == "image":
                 img = await response.aread()
+                # 非缩略图：先判断是否超长图，是则在压缩前对原图切片，逐片返回多个文件
+                if not is_thumbnail and compression and mediatype[1] in ["jpeg", "png"]:
+                    pieces = split_long_image_bytes(img)
+                    if pieces:
+                        piece_paths: list[Path] = []
+                        for i, pbytes in enumerate(pieces):
+                            pp = media.with_name(f"{media.stem}_p{i + 1}.jpg")
+                            with pp.open("wb") as pf:
+                                pf.write(pbytes)
+                            piece_paths.append(pp)
+                        logger.info(f"完成下载(切片): {media.name} -> {len(piece_paths)} 片")
+                        return piece_paths
                 if compression and mediatype[1] in ["jpeg", "png"]:
                     logger.info(f"压缩: {url} {mediatype[1]}")
                     if is_thumbnail:
                         img = compress(BytesIO(img), size=320, format="JPEG").getvalue()
                     else:
-                        # fix_ratio=True 修正超长图比例（宽高比>20会被 Telegram 拒收为 photo）
-                        img = compress(BytesIO(img), fix_ratio=True).getvalue()
+                        # 用 JPEG 保持与 .jpg 文件名一致（默认 PNG 会让本地 Bot API 按扩展名误判为 document）；
+                        # fix_ratio=True 兜底修正极端比例图
+                        img = compress(BytesIO(img), fix_ratio=True, format="JPEG").getvalue()
                 with temp_media.open("wb") as file:
                     file.write(img)
             else:
@@ -195,6 +216,71 @@ async def handle_dash_media(f: ParsedContent, client: httpx.AsyncClient):
                 item.unlink(missing_ok=True)
 
 
+def split_long_image_bytes(
+    raw: bytes, ratio: float = IMAGE_SPLIT_RATIO, max_pieces: int = IMAGE_SPLIT_MAX_PIECES
+) -> list[bytes] | None:
+    """对原始图片字节，若高宽比 > ratio 则按高度切成多片（在压缩之前对原图切，避免细条信息损毁），
+    每片单独编码为 JPEG bytes 返回。非超长图返回 None（表示无需切割，走常规压缩）。"""
+    try:
+        with Image.open(BytesIO(raw)) as im:
+            w, h = im.size
+            if w <= 0 or h <= 0 or h / w <= ratio:
+                return None
+            slice_h = int(w * ratio)  # 每片目标高度，使切片比例接近 ratio
+            n = math.ceil(h / slice_h)
+            if n > max_pieces:
+                # 超过上限：放大每片高度，保证总片数不超过 max_pieces（末片可能略超比例，可接受）
+                n = max_pieces
+                slice_h = math.ceil(h / n)
+            im = im.convert("RGB")
+            pieces: list[bytes] = []
+            for i in range(n):
+                top = i * slice_h
+                bottom = min(top + slice_h, h)
+                if top >= bottom:
+                    break
+                crop = im.crop((0, top, w, bottom))
+                # 仅当切片仍超出 tdlib 约束(w+h<=10000)时才等比缩小（极端长图+片数上限才会触发）
+                if crop.size[0] + crop.size[1] > 10000:
+                    crop.thumbnail((4000, 8000), Image.Resampling.LANCZOS)
+                buf = BytesIO()
+                crop.save(buf, "JPEG", optimize=True)
+                pieces.append(buf.getvalue())
+            logger.info(f"超长图切割: {w}x{h} -> {len(pieces)} 片")
+            return pieces or None
+    except Exception as e:
+        logger.error(f"超长图切割失败，按原图压缩: {e}")
+        return None
+
+
+def expand_long_images(f: ParsedContent, media: list) -> list:
+    """把 media/urls/filenames 中已切片的占位项展开，保持三者索引对齐。
+    切片产物由 get_media 以 list[Path] 形式返回，这里把嵌套 list 摊平并复制对应的 url。"""
+    if not f.media or not media:
+        return media
+    new_media: list = []
+    new_urls: list = []
+    new_filenames: list = []
+    urls = f.media.urls
+    filenames = f.media.filenames
+    for idx, item in enumerate(media):
+        url = urls[idx] if idx < len(urls) else ""
+        fn = filenames[idx] if idx < len(filenames) else ""
+        if isinstance(item, list):
+            # 一张超长图被切成多片
+            for j, p in enumerate(item):
+                new_media.append(p)
+                new_urls.append(url)
+                new_filenames.append(f"{Path(fn).stem or 'image'}_p{j + 1}.jpg" if fn else getattr(p, "name", fn))
+        else:
+            new_media.append(item)
+            new_urls.append(url)
+            new_filenames.append(fn)
+    f.media.urls = new_urls
+    f.media.filenames = new_filenames
+    return new_media
+
+
 async def get_media_for_content(
     f: ParsedContent,
     compression: bool = True,
@@ -249,7 +335,20 @@ async def get_media_for_content(
                 )
                 for m, fn in zip(f.media.urls, f.media.filenames, strict=False)
             ]
-            media = [m for m in await asyncio.gather(*tasks) if m]
+            raw_media = await asyncio.gather(*tasks)
+            # 过滤下载失败(None)的项时，同步剔除对应的 url/filename，保持索引对齐
+            kept_urls: list = []
+            kept_fns: list = []
+            media = []
+            for m, u, fn in zip(raw_media, f.media.urls, f.media.filenames, strict=False):
+                if m:
+                    media.append(m)
+                    kept_urls.append(u)
+                    kept_fns.append(fn)
+            f.media.urls = kept_urls
+            f.media.filenames = kept_fns
+            # 下载后把超长图切成多张，避免被 Telegram 判为 document
+            media = expand_long_images(f, media)
         else:
             if f.media.type in ["video", "audio"]:
                 media = [referer_url(f.media.urls[0], f.url)]
@@ -517,14 +616,10 @@ class UploadQueueManager:
     async def _upload_media_group(
         self, message: Message, f: ParsedContent, media: list, mediathumb: Any, caption: str
     ) -> tuple:
-        if len(f.media.urls) <= 10:
-            splits = [(media, f.media.urls, f.media.filenames)]
-        else:
-            mid = len(f.media.urls) // 2
-            splits = [
-                (media[:mid], f.media.urls[:mid], f.media.filenames[:mid]),
-                (media[mid:], f.media.urls[mid:], f.media.filenames[mid:]),
-            ]
+        # 按 Telegram media group 单组上限 10 张分批（切割超长图后总数可能远超 10）
+        urls = f.media.urls
+        fns = f.media.filenames
+        splits = [(media[i : i + 10], urls[i : i + 10], fns[i : i + 10]) for i in range(0, len(media), 10)]
         result = tuple()
         for sub_media, sub_urls, sub_fns in splits:
             sub_result = await message.reply_media_group(
