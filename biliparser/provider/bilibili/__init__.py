@@ -18,6 +18,7 @@ from .api import (
     BILIBILI_DESKTOP_HEADER,
     CACHES_TIMER,
     ParserException,
+    SkippedURLException,
     bili_api_request,
     referer_url,
     retry_catcher,
@@ -37,6 +38,22 @@ _BILIBILI_RE = re.compile(
     r"|b23\.tv"  # short links
     r"|(?:BV\w{10})"  # bare BV id
     r"|(?:av\d+)"  # bare av id
+    r")",
+    re.IGNORECASE,
+)
+
+# 已知无内容可解析的 Bilibili 链接（多为动态正文里夹带）。这些会匹配上面的总正则，
+# 但没有对应解析策略，直接静默跳过，避免刷 "URL无可用策略" ERROR 日志。
+_SKIP_URL_RE = re.compile(
+    r"(?:"
+    r"mall\.bilibili\.com"  # 会员购商城
+    r"|space\.bilibili\.com"  # UP 主空间
+    r"|account\.bilibili\.com"  # 账号页
+    r"|passport\.bilibili\.com"  # 登录页
+    r"|live\.bilibili\.com/p/"  # 直播活动页（非直播间）
+    r"|www\.bilibili\.com/blackboard"  # 活动专题页
+    r"|show\.bilibili\.com"  # 会员购演出
+    r"|search\.bilibili\.com"  # 搜索页
     r")",
     re.IGNORECASE,
 )
@@ -97,6 +114,9 @@ def _feed_to_parsed_content(f: Feed) -> ParsedContent:
 
 @retry_catcher
 async def _route(client: httpx.AsyncClient, url: str, constraints=None, extra: dict | None = None) -> Feed:
+    # 已知无内容可解析的链接（商城/空间/活动页等），静默跳过
+    if _SKIP_URL_RE.search(url):
+        raise SkippedURLException("已知无可解析内容的链接", url)
     # bare BV/av/ep/ss ids or short paths
     if re.search(r"(?:^|/)(?:BV\w{10}|av\d+|ep\d+|ss\d+)", url):
         return await Video(url if "/" in url else f"b23.tv/{url}", client).handle(constraints=constraints, extra=extra)

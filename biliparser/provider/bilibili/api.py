@@ -35,10 +35,17 @@ class ParserException(Exception):
         return f"{self.msg}: {self.url} ->\n{self.res}"
 
 
+class SkippedURLException(ParserException):
+    """已知无内容可解析的 URL（如商城、UP 主空间、活动页），静默跳过，不记 ERROR。"""
+
+
 def retry_catcher(func):
     async def inner_function(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
+        except SkippedURLException as err:
+            logger.debug(f"跳过无可解析内容的链接: {err}")
+            return err
         except ParserException as err:
             logger.error(err)
             return err
