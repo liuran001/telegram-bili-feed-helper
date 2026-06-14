@@ -14,3 +14,4 @@ data
 
 dist/
 .tmp/
+stack.env

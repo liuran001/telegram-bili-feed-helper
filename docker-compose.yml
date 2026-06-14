@@ -32,7 +32,7 @@ services:
       - internal_network
 
   telegram-bili-feed-helper:
-    image: ghcr.io/simonsmh/telegram-bili-feed-helper:master
+    image: ghcr.io/liuran001/telegram-bili-feed-helper:master
     depends_on:
       - redis
       - postgres

@@ -354,16 +354,21 @@ class UploadQueueManager:
         if task.task_type == "fetch":
             await self._process_fetch_task(task)
             return
-        MAX_RETRIES = 4  # noqa: N806
-        for attempt in range(1, MAX_RETRIES + 1):
+        max_retries = int(os.environ.get("UPLOAD_MAX_RETRIES", 4))
+        for attempt in range(1, max_retries + 1):
             async with self._lock:
                 if task.task_id not in self.active_tasks.get(task.user_id, {}):
                     return
-            success = await self._try_upload_once(task, attempt, MAX_RETRIES)
+            success = await self._try_upload_once(task, attempt, max_retries)
             if success:
                 return
-            if attempt < MAX_RETRIES and not await self._retry_parse_url(task):
-                break
+            if attempt < max_retries:
+                # 网络错误（如上传超时）重试前退避，避免瞬时连发 4 次仍超时
+                backoff = min(2 ** (attempt - 1), 30)
+                logger.info(f"任务 {task.task_id[:8]} 第 {attempt}/{max_retries} 次失败，{backoff}s 后重试")
+                await asyncio.sleep(backoff)
+                if not await self._retry_parse_url(task):
+                    break
 
     async def _retry_parse_url(self, task: UploadTask) -> bool:
         try:

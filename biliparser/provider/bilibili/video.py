@@ -31,6 +31,8 @@ class Video(Feed):
     infocontent: dict = {}
     page = 1
     quality = video.VideoQuality._8K
+    quality_explicit: bool = False  # 用户是否显式指定了画质（/video <画质>），指定时不自动降档
+    _dash_size_exhausted: bool = False  # DASH 所有画质均超过降档阈值时置位，供 handle() 回退封面
     reply_type: int = 1
 
     def extract_episode_info(self, target: str):
@@ -100,6 +102,7 @@ class Video(Feed):
         ]
         best_match = max(similarities, key=lambda x: x[1])
         self.quality = video.VideoQuality[best_match[0]]
+        self.quality_explicit = True
 
     def clear_cached_properties(self):
         for key in ["epid", "ssid", "aid", "bvid", "cid"]:
@@ -193,32 +196,81 @@ class Video(Feed):
         if not audio_url:
             logger.error(f"无可用Dash视频音频流清晰度: {streams}")
             return False
-        size_limit = int(os.environ.get("VIDEO_SIZE_LIMIT", max_size))
         dash_duration = dash_info.get("duration", 0)
+        hard_limit = int(os.environ.get("VIDEO_SIZE_LIMIT", max_size))
+        if self.quality_explicit:
+            # 显式指定画质：不自动降档，只取不超过请求档的最高画质
+            # detect() 可能返回高于 video_max_quality 的流（如 DOLBY=126），需按 value 上限过滤
+            capped = [s for s in video_streams if s.video_quality.value <= self.quality.value]
+            if not capped:
+                # 没有任何流满足上限（极少见），退回到 detect 的最低档
+                capped = sorted(video_streams, key=lambda x: x.video_quality.value)[:1]
+            video_stream = capped[0]
+            video_size, video_stream.url = await self.test_url_status_code(video_stream.url, self.url)
+            if not video_size:
+                logger.error(f"无可用Dash视频流清晰度: {streams}")
+                return False
+            total_size = audio_size + video_size
+            if total_size >= hard_limit:
+                raise ParserException(
+                    f"视频文件过大：{video_stream.video_quality.name} 约 {self.human_size(total_size)}，"
+                    f"超过大小限制 {self.human_size(hard_limit)}，请指定更低画质后重试",
+                    self.url,
+                )
+            logger.info(f"选择Dash视频清晰度(指定):{video_stream.video_quality.name} 大小:{video_size}")
+            self.__commit_dash_media(video_stream, audio_url, total_size, dash_duration, stream_dimensions)
+            return True
+        # 自动模式：从高到低逐档检查体积，选取首个不超过降档阈值的画质
+        # VIDEO_DOWNGRADE_SIZE 未配置时回退到 VIDEO_SIZE_LIMIT，保持旧行为
+        downgrade_env = os.environ.get("VIDEO_DOWNGRADE_SIZE")
+        downgrade_limit = int(downgrade_env) if downgrade_env else hard_limit
         for video_stream in video_streams:
             video_size, video_stream.url = await self.test_url_status_code(video_stream.url, self.url)
-            if audio_size and video_size and (audio_size + video_size < size_limit):
+            if audio_size and video_size and (audio_size + video_size < downgrade_limit):
                 logger.info(f"选择Dash视频清晰度:{video_stream.video_quality.name} 大小:{video_size}")
-                self.mediaurls = [video_stream.url, audio_url]
-                self.mediatype = "video"
-                self.mediaraws = True
-                self.mediamerge = True
-                self.mediafilesize = audio_size + video_size
-                if dash_duration:
-                    self.mediaduration = dash_duration
-                w, h = next(
-                    (
-                        (w, h)
-                        for (qid, codecs), (w, h) in stream_dimensions.items()
-                        if qid == video_stream.video_quality.value
-                        and codecs.startswith(video_stream.video_codecs.value)
-                    ),
-                    (0, 0),
+                self.__commit_dash_media(
+                    video_stream, audio_url, audio_size + video_size, dash_duration, stream_dimensions
                 )
-                if w and h:
-                    self.mediadimention = {"width": w, "height": h, "rotate": self.mediadimention.get("rotate", 0)}
                 return True
-        logger.error(f"无可用Dash视频流清晰度: {streams}")
+        # 所有画质（含最低档）均超过降档阈值。仅当用户显式配置了 VIDEO_DOWNGRADE_SIZE
+        # 才回退封面（新行为）；否则保持旧行为（保留已有的 MP4 直链或封面，不强制覆盖）。
+        if downgrade_env:
+            logger.warning(f"所有Dash画质均超过降档阈值 {self.human_size(downgrade_limit)}，回退封面: {self.url}")
+            self._dash_size_exhausted = True
+        else:
+            logger.error(f"无可用Dash视频流清晰度: {streams}")
+        return False
+
+    def __commit_dash_media(self, video_stream, audio_url, total_size, dash_duration, stream_dimensions):
+        """将选定的 DASH 视频/音频轨写入媒体字段，并使用实际流分辨率设置尺寸。"""
+        self.mediaurls = [video_stream.url, audio_url]
+        self.mediatype = "video"
+        self.mediaraws = True
+        self.mediamerge = True
+        self.mediafilesize = total_size
+        if dash_duration:
+            self.mediaduration = dash_duration
+        # bilibili-api 17.4.1 部分流 video_codecs 为 None，需空值保护，否则崩溃导致尺寸残留为原始上传分辨率
+        codec_val = video_stream.video_codecs.value if video_stream.video_codecs else ""
+        w, h = next(
+            (
+                (w, h)
+                for (qid, codecs), (w, h) in stream_dimensions.items()
+                if qid == video_stream.video_quality.value and (not codec_val or codecs.startswith(codec_val))
+            ),
+            (0, 0),
+        )
+        if w and h:
+            self.mediadimention = {"width": w, "height": h, "rotate": self.mediadimention.get("rotate", 0)}
+
+    @staticmethod
+    def human_size(num: int) -> str:
+        size = float(num)
+        for unit in ["B", "KB", "MB", "GB"]:
+            if size < 1024 or unit == "GB":
+                return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}{unit}"
+            size /= 1024
+        return f"{num}B"
 
     async def handle(self, constraints=None, extra: dict | None = None) -> "Video":
         max_size = constraints.max_upload_size if constraints else _DEFAULT_MAX_SIZE
@@ -439,6 +491,7 @@ class Video(Feed):
                 "rotate": self.mediadimention.get("rotate", 0),
             }
         self.mediatype = "image"
+        cover_url = detail.get("pic")
         self.replycontent = await self.parse_reply(self.aid, self.reply_type, seek_id)
         try:
             for mp4_qn in [
@@ -449,6 +502,19 @@ class Video(Feed):
                 if await self.__get_video_result(mp4_qn, max_size):
                     break
             await self.__get_dash_video(max_size)
+        except ParserException:
+            # 显式指定画质且超过大小限制：直接向上抛出，提示用户文件过大
+            raise
         except Exception as e:
             logger.exception(f"视频下载解析错误: {e}")
+        # 自动降档模式下所有画质均超阈值：强制回退封面，清空视频相关字段
+        if self._dash_size_exhausted:
+            logger.info(f"回退发送封面: {self.url}")
+            self.mediaurls = cover_url
+            self.mediathumb = cover_url
+            self.mediatype = "image"
+            self.mediaraws = False
+            self.mediamerge = False
+            self.mediafallbackurl = ""
+            self.mediafilesize = 0
         return self
