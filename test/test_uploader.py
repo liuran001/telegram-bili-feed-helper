@@ -146,3 +146,43 @@ async def test_cache_does_not_cross_media_types(_db):
     await cache_media(fn, _Att("PHOTO_FILE_ID"), "photo")
     assert await get_cached_media_file_id(fn, "photo") == "PHOTO_FILE_ID"
     assert await get_cached_media_file_id(fn, "document") == "DOC_FILE_ID"
+
+
+# ---- 动态图片只发前 10 张，不拆多组刷屏 ----
+
+
+async def test_media_group_caps_at_ten_single_group():
+    """超过 10 张图（含切片后）只发一个 media group + 一条文字说明，不拆成多组连发"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from biliparser.channel.telegram.uploader import UploadQueueManager
+    from biliparser.model import Author, MediaInfo, ParsedContent
+
+    n = 15
+    f = ParsedContent(
+        url="https://t.bilibili.com/123",
+        author=Author(name="tester"),
+        content="",
+        media=MediaInfo(
+            urls=[f"https://i0.hdslb.com/p{i}.jpg" for i in range(n)],
+            type="image",
+            filenames=[f"p{i}.jpg" for i in range(n)],
+        ),
+    )
+    message = MagicMock()
+    # reply_media_group 返回与入参等长的结果元组，模拟 Telegram 行为
+    message.reply_media_group = AsyncMock(side_effect=lambda media, **kw: tuple(MagicMock() for _ in media))
+    message.reply_text = AsyncMock()
+
+    mgr = UploadQueueManager()
+    result = await mgr._upload_media_group(message, f, list(f.media.urls), None, "caption")
+
+    # 只发一个 media group
+    assert message.reply_media_group.call_count == 1
+    # 组内恰好 10 项
+    sent = message.reply_media_group.call_args.args[0]
+    assert len(sent) == 10
+    # 文字说明只发一次
+    assert message.reply_text.call_count == 1
+    # 返回结果与发送项数一致（供缓存对齐）
+    assert len(result) == 10

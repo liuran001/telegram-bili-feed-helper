@@ -646,23 +646,24 @@ class UploadQueueManager:
     async def _upload_media_group(
         self, message: Message, f: ParsedContent, media: list, mediathumb: Any, caption: str
     ) -> tuple:
-        # 按 Telegram media group 单组上限 10 张分批（切割超长图后总数可能远超 10）
-        urls = f.media.urls
-        fns = f.media.filenames
-        splits = [(media[i : i + 10], urls[i : i + 10], fns[i : i + 10]) for i in range(0, len(media), 10)]
-        result = tuple()
-        for sub_media, sub_urls, sub_fns in splits:
-            sub_result = await message.reply_media_group(
-                [
-                    (
-                        InputMediaVideo(img, caption=caption, filename=fn, supports_streaming=True)
-                        if ".gif" in mu
-                        else InputMediaPhoto(img, caption=caption, filename=fn)
-                    )
-                    for img, mu, fn in zip(sub_media, sub_urls, sub_fns, strict=False)
-                ],
-            )
-            result += sub_result
+        # Telegram media group 单组上限 10 张。切割超长图后总数可能远超 10，
+        # 只取前 10 张发送一个组（不再拆成多组连发），下方补一条文字说明，避免一条动态刷屏。
+        limit = 10
+        if len(media) > limit:
+            logger.info(f"动态媒体 {len(media)} 项超过单组上限，仅发送前 {limit} 项")
+        sub_media = media[:limit]
+        sub_urls = f.media.urls[:limit]
+        sub_fns = f.media.filenames[:limit]
+        result = await message.reply_media_group(
+            [
+                (
+                    InputMediaVideo(img, caption=caption, filename=fn, supports_streaming=True)
+                    if ".gif" in mu
+                    else InputMediaPhoto(img, caption=caption, filename=fn)
+                )
+                for img, mu, fn in zip(sub_media, sub_urls, sub_fns, strict=False)
+            ],
+        )
         await message.reply_text(caption)
         return result
 
