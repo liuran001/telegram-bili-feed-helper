@@ -303,7 +303,7 @@ async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def inlineparse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline queries."""
     from ...provider.bilibili.api import referer_url
-    from .uploader import get_cached_media_file_id
+    from .uploader import _send_kind, get_cached_media_file_id
 
     async def inline_query_answer(inline_query: InlineQuery, msg):
         try:
@@ -373,7 +373,7 @@ async def inlineparse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ]
     else:
         if f.media.type == "video":
-            cache_file_id = await get_cached_media_file_id(f.media.filenames[0]) if f.media.filenames else None
+            cache_file_id = await get_cached_media_file_id(f.media.filenames[0], "video") if f.media.filenames else None
             # DASH 分离流无法被 Telegram inline 直接播放，优先使用 MP4 直链 fallback_url
             inline_video_url = f.media.fallback_url or f.media.urls[0]
             results = [
@@ -401,7 +401,7 @@ async def inlineparse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
             ]
         elif f.media.type == "audio":
-            cache_file_id = await get_cached_media_file_id(f.media.filenames[0]) if f.media.filenames else None
+            cache_file_id = await get_cached_media_file_id(f.media.filenames[0], "audio") if f.media.filenames else None
             results = [
                 (
                     InlineQueryResultCachedAudio(
@@ -424,7 +424,12 @@ async def inlineparse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             import asyncio
 
             cache_file_ids = (
-                await asyncio.gather(*[get_cached_media_file_id(fn) for fn in f.media.filenames])
+                await asyncio.gather(
+                    *[
+                        get_cached_media_file_id(fn, _send_kind(f.media.type, url))
+                        for fn, url in zip(f.media.filenames, f.media.urls, strict=False)
+                    ]
+                )
                 if f.media.filenames
                 else []
             )

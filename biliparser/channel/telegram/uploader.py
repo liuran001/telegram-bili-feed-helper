@@ -62,18 +62,46 @@ class UploadTask:
     cancelled: bool = field(default=False)
 
 
-async def get_cached_media_file_id(filename: str) -> str | None:
-    file = await TelegramFileCache.get_or_none(mediafilename=filename)
+# Telegram file_id 与媒体类型强绑定：同一个 file_id 不能跨类型复用（本地 Bot API 会在构造
+# InputMediaPhoto 时直接拒绝一个 document 类型的 file_id，报 "Can't use file of type document as photo"）。
+# parse 路径按 photo/video/audio/gif 发送，/fetch 路径按 document 发送，二者对同一图片 URL 派生出
+# 相同的 filename，若共用缓存 key 就会串号。这里给缓存主键加类型前缀做命名空间隔离。
+# mediafilename 主键为 CharField(64)，真实文件名最长约 44 字符，加前缀后仍在上限内；极端情况下截断保护。
+_CACHE_KEY_MAXLEN = 64
+
+
+def _cache_key(filename: str, kind: str) -> str:
+    return f"{kind}:{filename}"[:_CACHE_KEY_MAXLEN]
+
+
+def _send_kind(media_type: str | None, url: Path | str | None = None, document: bool = False) -> str:
+    """推断一个媒体最终以哪种 Telegram 类型发送，作为缓存命名空间。
+    /fetch 路径统一发 document；parse 路径按 media.type 与 .gif 后缀区分 video/audio/gif/photo。"""
+    if document:
+        return "document"
+    if media_type == "video":
+        return "video"
+    if media_type == "audio":
+        return "audio"
+    if url is not None and ".gif" in str(url):
+        return "gif"
+    return "photo"
+
+
+async def get_cached_media_file_id(filename: str, kind: str = "photo") -> str | None:
+    file = await TelegramFileCache.get_or_none(mediafilename=_cache_key(filename, kind))
     if file:
         return file.file_id
     return None
 
 
-async def cache_media(mediafilename: str, file) -> None:
+async def cache_media(mediafilename: str, file, kind: str = "photo") -> None:
     if not file:
         return
     try:
-        await TelegramFileCache.update_or_create(mediafilename=mediafilename, defaults=dict(file_id=file.file_id))
+        await TelegramFileCache.update_or_create(
+            mediafilename=_cache_key(mediafilename, kind), defaults=dict(file_id=file.file_id)
+        )
     except Exception as e:
         logger.exception(e)
 
@@ -93,11 +121,12 @@ async def get_media(
     media_check_ignore: bool = False,
     no_cache: bool = False,
     is_thumbnail: bool = False,
+    cache_kind: str = "photo",
 ) -> Path | str | None:
     if isinstance(url, Path):
         return url
     if not no_cache:
-        file_id = await get_cached_media_file_id(filename)
+        file_id = await get_cached_media_file_id(filename, cache_kind)
         if file_id:
             return file_id
     LOCAL_MEDIA_FILE_PATH.mkdir(parents=True, exist_ok=True)
@@ -180,7 +209,7 @@ async def handle_dash_media(f: ParsedContent, client: httpx.AsyncClient):
         merged_name = Path(base_name).stem + "_merged.mp4"
         cache_dash_file = LOCAL_MEDIA_FILE_PATH / merged_name
 
-        cache_dash = await get_cached_media_file_id(cache_dash_file.name)
+        cache_dash = await get_cached_media_file_id(cache_dash_file.name, "video")
         if cache_dash:
             f.media.urls = [str(cache_dash_file.absolute())]
             f.media.filenames = [cache_dash_file.name]
@@ -332,6 +361,7 @@ async def get_media_for_content(
                     fn,
                     compression=compression,
                     media_check_ignore=media_check_ignore,
+                    cache_kind=_send_kind(f.media.type, m, document=media_check_ignore),
                 )
                 for m, fn in zip(f.media.urls, f.media.filenames, strict=False)
             ]
@@ -639,19 +669,23 @@ class UploadQueueManager:
     async def _cache_upload_result(self, f: ParsedContent, result: Any) -> None:
         if result is None or not f.media or not f.media.filenames:
             return
+        urls = f.media.urls
         if isinstance(result, tuple):
-            for filename, item in zip(f.media.filenames, result, strict=False):
+            for idx, (filename, item) in enumerate(zip(f.media.filenames, result, strict=False)):
+                url = urls[idx] if idx < len(urls) else None
+                kind = _send_kind(f.media.type, url)
                 attachment = item.effective_attachment
                 if isinstance(attachment, tuple):
-                    await cache_media(filename, attachment[0])
+                    await cache_media(filename, attachment[0], kind)
                 else:
-                    await cache_media(filename, attachment)
+                    await cache_media(filename, attachment, kind)
         else:
+            kind = _send_kind(f.media.type, urls[0] if urls else None)
             attachment = result.effective_attachment
             if isinstance(attachment, tuple):
-                await cache_media(f.media.filenames[0], attachment[0])
+                await cache_media(f.media.filenames[0], attachment[0], kind)
             else:
-                await cache_media(f.media.filenames[0], attachment)
+                await cache_media(f.media.filenames[0], attachment, kind)
 
     async def _process_fetch_task(self, task: UploadTask) -> None:
         f = task.parsed_content
@@ -682,7 +716,7 @@ class UploadQueueManager:
                         caption=caption,
                         filename=mediafilenames[0],
                     )
-                    await cache_media(mediafilenames[0], result.effective_attachment)
+                    await cache_media(mediafilenames[0], result.effective_attachment, "document")
                 else:
                     if len(medias) <= 10:
                         splits = [(medias, mediafilenames)]
@@ -702,9 +736,9 @@ class UploadQueueManager:
                     for filename, item in zip(mediafilenames, result, strict=False):
                         attachment = item.effective_attachment
                         if isinstance(attachment, tuple):
-                            await cache_media(filename, attachment[0])
+                            await cache_media(filename, attachment[0], "document")
                         else:
-                            await cache_media(filename, attachment)
+                            await cache_media(filename, attachment, "document")
             except Exception as err:
                 logger.exception(f"fetch 任务失败: {err} - {f.url}")
             finally:

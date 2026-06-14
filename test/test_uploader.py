@@ -4,11 +4,16 @@ import tempfile
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from biliparser.channel.telegram.uploader import (
+    _cache_key,
     _get_constraints,
+    _send_kind,
+    cache_media,
     cleanup_medias,
+    get_cached_media_file_id,
     split_long_image_bytes,
 )
 
@@ -80,3 +85,64 @@ def test_get_constraints_default():
     assert mc.max_upload_size == 50 * 1024 * 1024  # 50MB (non-local mode)
     assert mc.max_download_size == 2 * 1024 * 1024 * 1024
     assert mc.caption_max_length == 1024
+
+
+# ---- file_id 缓存按媒体类型命名空间隔离（防止 document file_id 被当 photo 用）----
+
+
+def test_cache_key_namespaced_by_kind():
+    """同一文件名在不同 kind 下生成不同主键"""
+    fn = "abc.jpg"
+    assert _cache_key(fn, "photo") != _cache_key(fn, "document")
+    assert _cache_key(fn, "photo") == "photo:abc.jpg"
+    assert _cache_key(fn, "document") == "document:abc.jpg"
+
+
+def test_cache_key_truncated_to_primary_key_limit():
+    """主键长度受 CharField(64) 限制，超长需截断而非溢出"""
+    key = _cache_key("x" * 100, "document")
+    assert len(key) <= 64
+
+
+def test_send_kind_dispatch():
+    """发送类型推断：/fetch document 优先，其次按 media.type 与 .gif 后缀"""
+    assert _send_kind("image", "http://a.jpg", document=True) == "document"
+    assert _send_kind("video", "http://a.mp4", document=True) == "document"  # fetch 总是 document
+    assert _send_kind("video", "http://a.mp4") == "video"
+    assert _send_kind("audio", "http://a.m4a") == "audio"
+    assert _send_kind("image", "http://a.gif") == "gif"
+    assert _send_kind("image", "http://a.jpg") == "photo"
+    assert _send_kind("image", None) == "photo"
+
+
+class _Att:
+    def __init__(self, fid):
+        self.file_id = fid
+
+
+@pytest.fixture
+async def _db():
+    from tortoise import Tortoise
+
+    await Tortoise.init(db_url="sqlite://:memory:", modules={"models": ["biliparser.storage.models"]})
+    await Tortoise.generate_schemas()
+    try:
+        yield
+    finally:
+        await Tortoise.close_connections()
+
+
+async def test_cache_does_not_cross_media_types(_db):
+    """回归：同一文件名先以 document 缓存，photo 读取必须 miss（否则 document file_id 会被塞进 InputMediaPhoto）"""
+    fn = "1211407624821538837_p1.jpg"
+    await cache_media(fn, _Att("DOC_FILE_ID"), "document")
+
+    # photo 命名空间下读取不应命中 document 的 file_id
+    assert await get_cached_media_file_id(fn, "photo") is None
+    # document 命名空间下能正确命中
+    assert await get_cached_media_file_id(fn, "document") == "DOC_FILE_ID"
+
+    # 之后以 photo 正确上传并缓存，两者互不覆盖
+    await cache_media(fn, _Att("PHOTO_FILE_ID"), "photo")
+    assert await get_cached_media_file_id(fn, "photo") == "PHOTO_FILE_ID"
+    assert await get_cached_media_file_id(fn, "document") == "DOC_FILE_ID"

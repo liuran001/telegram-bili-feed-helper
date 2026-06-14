@@ -3,7 +3,6 @@ import os
 from ...model import MediaConstraints, ParsedContent
 from ...model import PreparedMedia as PreparedMedia
 from ...provider import ProviderRegistry
-from ...storage.models import TelegramFileCache
 from ...utils import logger
 from .. import Channel
 
@@ -41,10 +40,10 @@ class TelegramChannel(Channel):
         pass
 
     async def get_cached_media(self, filename: str) -> str | None:
-        file = await TelegramFileCache.get_or_none(mediafilename=filename)
-        if file:
-            return file.file_id
-        return None
+        # 通用接口默认按 photo 命名空间读取（file_id 与媒体类型强绑定，见 uploader._cache_key）
+        from .uploader import get_cached_media_file_id
+
+        return await get_cached_media_file_id(filename, "photo")
 
     async def start(self, provider_registry: ProviderRegistry) -> None:
         self._registry = provider_registry
