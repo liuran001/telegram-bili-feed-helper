@@ -54,7 +54,7 @@ SOURCE_CODE_MARKUP = InlineKeyboardMarkup(
         [
             InlineKeyboardButton(
                 text="源代码",
-                url="https://github.com/simonsmh/telegram-bili-feed-helper",
+                url="https://github.com/liuran001/telegram-bili-feed-helper",
             )
         ]
     ]
@@ -245,6 +245,7 @@ async def parse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             is_parse_cmd=is_parse,
             is_video_cmd=is_video,
             urls=urls,
+            extra=extra,
         )
 
         upload_queue_manager: UploadQueueManager = context.bot_data["upload_queue_manager"]

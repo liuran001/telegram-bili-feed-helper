@@ -26,6 +26,12 @@ from ...utils import compress, logger
 LOCAL_MEDIA_FILE_PATH = Path(os.environ.get("LOCAL_TEMP_FILE_PATH", str(Path.cwd()))) / ".tmp"
 LOCAL_MODE = bool(os.environ.get("LOCAL_MODE", False))
 
+# 大体积视频上传到本地 Bot API 后，服务端还需把文件转发给 Telegram 再返回响应，可能耗时数分钟。
+# 默认 read_timeout(60s) 会在上传其实已成功、仅在等待响应时误报 Timed out，进而触发重试重复发送
+# （上传写入超时由 application 的 media_write_timeout 控制，这里只放宽等待响应的 read_timeout）。
+_MEDIA_READ_TIMEOUT = int(os.environ.get("MEDIA_READ_TIMEOUT", os.environ.get("MEDIA_WRITE_TIMEOUT", 600)))
+
+
 # 超长图切割：高宽比超过该值则按高度切成多片，使每片接近此比例（默认 2，保证切片清晰可读）。
 # Telegram photo 限制 width+height<=10000，且过细长条会被本地 Bot API 判为 document。
 IMAGE_SPLIT_RATIO = float(os.environ.get("IMAGE_SPLIT_RATIO", 2))
@@ -58,6 +64,7 @@ class UploadTask:
     urls: list[str]
     task_type: str = "parse"
     fetch_mode: str | None = None
+    extra: dict | None = None
     task_id: str = field(default_factory=lambda: uuid4().hex)
     cancelled: bool = field(default=False)
 
@@ -506,7 +513,9 @@ class UploadQueueManager:
             from ...provider.bilibili import BilibiliProvider
 
             provider = BilibiliProvider()
-            results = await provider.parse([task.parsed_content.url], _get_constraints())
+            # 透传原始 extra（如 /video <画质> 的显式画质），否则重试会丢失指定画质退回自动降档，
+            # 既可能发出与首次不同清晰度的第二份视频，也违背用户指定。
+            results = await provider.parse([task.parsed_content.url], _get_constraints(), extra=task.extra)
             if results and not isinstance(results[0], Exception):
                 task.parsed_content = results[0]
                 return True
@@ -609,10 +618,14 @@ class UploadQueueManager:
                 caption=caption,
                 supports_streaming=True,
                 thumbnail=mediathumb,
+                # cover 与 thumbnail 同源：部分客户端（尤其 HDR/杜比视界视频）不渲染 thumbnail，
+                # 需同时提供 Bot API 的 cover 才能稳定显示封面帧
+                cover=mediathumb,
                 duration=f.media.duration,
                 filename=f.media.filenames[0] if f.media.filenames else None,
                 width=f.media.dimension.get("width", 0),
                 height=f.media.dimension.get("height", 0),
+                read_timeout=_MEDIA_READ_TIMEOUT,
             )
         elif f.media.type == "audio":
             result = await message.reply_audio(
@@ -623,6 +636,7 @@ class UploadQueueManager:
                 thumbnail=mediathumb,
                 title=f.media.title,
                 filename=f.media.filenames[0] if f.media.filenames else None,
+                read_timeout=_MEDIA_READ_TIMEOUT,
             )
         elif len(f.media.urls) == 1:
             if ".gif" in f.media.urls[0]:
@@ -630,12 +644,14 @@ class UploadQueueManager:
                     media[0],
                     caption=caption,
                     filename=f.media.filenames[0] if f.media.filenames else None,
+                    read_timeout=_MEDIA_READ_TIMEOUT,
                 )
             else:
                 result = await message.reply_photo(
                     media[0],
                     caption=caption,
                     filename=f.media.filenames[0] if f.media.filenames else None,
+                    read_timeout=_MEDIA_READ_TIMEOUT,
                 )
         else:
             result = await self._upload_media_group(message, f, media, mediathumb, caption)
@@ -670,6 +686,7 @@ class UploadQueueManager:
                 )
                 for i, (img, mu, fn) in enumerate(zip(sub_media, sub_urls, sub_fns, strict=False))
             ],
+            read_timeout=_MEDIA_READ_TIMEOUT,
         )
 
     async def _cache_upload_result(self, f: ParsedContent, result: Any) -> None:
@@ -721,6 +738,7 @@ class UploadQueueManager:
                         document=medias[0],
                         caption=caption,
                         filename=mediafilenames[0],
+                        read_timeout=_MEDIA_READ_TIMEOUT,
                     )
                     await cache_media(mediafilenames[0], result.effective_attachment, "document")
                 else:
@@ -736,6 +754,7 @@ class UploadQueueManager:
                     for sub_m, sub_fn in splits:
                         sub_result = await message.reply_media_group(
                             [InputMediaDocument(m, filename=fn) for m, fn in zip(sub_m, sub_fn, strict=False)],
+                            read_timeout=_MEDIA_READ_TIMEOUT,
                         )
                         result += sub_result
                     await message.reply_text(caption)

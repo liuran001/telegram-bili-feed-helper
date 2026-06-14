@@ -189,3 +189,99 @@ async def test_media_group_caps_at_ten_single_group():
     assert message.reply_text.call_count == 0
     # 返回结果与发送项数一致（供缓存对齐）
     assert len(result) == 10
+    # media group 同样放宽 read_timeout（与单图/视频一致，避免大相册误超时重发整组）
+    from biliparser.channel.telegram.uploader import _MEDIA_READ_TIMEOUT
+
+    assert message.reply_media_group.call_args.kwargs["read_timeout"] == _MEDIA_READ_TIMEOUT
+
+
+# ---- 上传重试保留显式画质（/video <画质>），避免重复发送不同清晰度 ----
+
+
+async def test_retry_parse_url_preserves_explicit_quality(monkeypatch):
+    """回归：首次上传超时重试时，重新解析必须透传原始 extra（如显式画质），
+    否则会退回自动降档、发出与首次不同清晰度的第二份视频。"""
+    from unittest.mock import MagicMock
+
+    import biliparser.provider.bilibili as bili_pkg
+    from biliparser.channel.telegram.uploader import UploadQueueManager, UploadTask
+    from biliparser.model import Author, MediaInfo, ParsedContent
+
+    f = ParsedContent(
+        url="https://www.bilibili.com/video/av1?p=1",
+        author=Author(name="tester"),
+        media=MediaInfo(urls=["v", "a"], type="video", filenames=["x.mp4"]),
+    )
+    task = UploadTask(
+        user_id=1,
+        message=MagicMock(),
+        parsed_content=f,
+        media=[],
+        mediathumb=None,
+        is_parse_cmd=False,
+        is_video_cmd=True,
+        urls=["https://www.bilibili.com/video/av1?p=1"],
+        extra={"quality": "dolby"},
+    )
+
+    captured: dict = {}
+
+    class _FakeProvider:
+        async def parse(self, urls, constraints, extra=None):
+            captured["extra"] = extra
+            return [f]
+
+    monkeypatch.setattr(bili_pkg, "BilibiliProvider", _FakeProvider)
+
+    mgr = UploadQueueManager()
+    ok = await mgr._retry_parse_url(task)
+
+    assert ok is True
+    # 关键断言：重试解析时把原始 extra 原样传给 provider.parse
+    assert captured["extra"] == {"quality": "dolby"}
+
+
+# ---- 视频上传带封面 cover + 放宽 read_timeout（修复 HDR/杜比无封面 与 大视频误超时重发）----
+
+
+async def test_video_upload_passes_cover_and_read_timeout(_db):
+    """video 发送须同时传 thumbnail 与 cover（部分客户端只认 cover 才显示封面），
+    并使用放宽的 read_timeout（大视频服务端处理慢，默认 60s 会误判超时触发重发）。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from biliparser.channel.telegram.uploader import _MEDIA_READ_TIMEOUT, UploadQueueManager, UploadTask
+    from biliparser.model import Author, MediaInfo, ParsedContent
+
+    f = ParsedContent(
+        url="https://www.bilibili.com/video/av1?p=1",
+        author=Author(name="tester"),
+        media=MediaInfo(
+            urls=["merged.mp4"],
+            type="video",
+            filenames=["merged.mp4"],
+            thumbnail="http://cover.jpg",
+            dimension={"width": 1920, "height": 1080, "rotate": 0},
+        ),
+    )
+    message = MagicMock()
+    message.reply_video = AsyncMock(return_value=MagicMock(effective_attachment=_Att("VID")))
+    task = UploadTask(
+        user_id=1,
+        message=message,
+        parsed_content=f,
+        media=["merged.mp4"],
+        mediathumb="thumb.jpg",
+        is_parse_cmd=False,
+        is_video_cmd=True,
+        urls=["https://www.bilibili.com/video/av1?p=1"],
+    )
+
+    mgr = UploadQueueManager()
+    await mgr._upload_media(task)
+
+    assert message.reply_video.call_count == 1
+    kwargs = message.reply_video.call_args.kwargs
+    assert kwargs["thumbnail"] == "thumb.jpg"
+    assert kwargs["cover"] == "thumb.jpg"
+    assert kwargs["read_timeout"] == _MEDIA_READ_TIMEOUT
+    assert _MEDIA_READ_TIMEOUT >= 600
