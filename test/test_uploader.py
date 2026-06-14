@@ -152,7 +152,7 @@ async def test_cache_does_not_cross_media_types(_db):
 
 
 async def test_media_group_caps_at_ten_single_group():
-    """超过 10 张图（含切片后）只发一个 media group + 一条文字说明，不拆成多组连发"""
+    """超过 10 张图（含切片后）只发一个 media group，caption 挂在第一项作说明，不额外发文字消息"""
     from unittest.mock import AsyncMock, MagicMock
 
     from biliparser.channel.telegram.uploader import UploadQueueManager
@@ -182,7 +182,10 @@ async def test_media_group_caps_at_ten_single_group():
     # 组内恰好 10 项
     sent = message.reply_media_group.call_args.args[0]
     assert len(sent) == 10
-    # 文字说明只发一次
-    assert message.reply_text.call_count == 1
+    # caption 只挂在第一项，其余项无 caption（避免重复/多余说明）
+    assert sent[0].caption == "caption"
+    assert all(item.caption is None for item in sent[1:])
+    # 不再额外发独立文字消息（说明已随相册显示在下方）
+    assert message.reply_text.call_count == 0
     # 返回结果与发送项数一致（供缓存对齐）
     assert len(result) == 10

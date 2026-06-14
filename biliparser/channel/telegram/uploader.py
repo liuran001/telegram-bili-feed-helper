@@ -647,25 +647,30 @@ class UploadQueueManager:
         self, message: Message, f: ParsedContent, media: list, mediathumb: Any, caption: str
     ) -> tuple:
         # Telegram media group 单组上限 10 张。切割超长图后总数可能远超 10，
-        # 只取前 10 张发送一个组（不再拆成多组连发），下方补一条文字说明，避免一条动态刷屏。
+        # 只取前 10 张发送一个组（不再拆成多组连发），避免一条动态刷屏。
         limit = 10
         if len(media) > limit:
             logger.info(f"动态媒体 {len(media)} 项超过单组上限，仅发送前 {limit} 项")
         sub_media = media[:limit]
         sub_urls = f.media.urls[:limit]
         sub_fns = f.media.filenames[:limit]
-        result = await message.reply_media_group(
+        # caption 只挂在媒体组第一项，Telegram 会把它显示在相册下方作为整组说明；
+        # 不再额外发独立文字消息，避免媒体与说明分成两条（与单图 reply_photo 行为一致）。
+        return await message.reply_media_group(
             [
                 (
-                    InputMediaVideo(img, caption=caption, filename=fn, supports_streaming=True)
+                    InputMediaVideo(
+                        img,
+                        caption=caption if i == 0 else None,
+                        filename=fn,
+                        supports_streaming=True,
+                    )
                     if ".gif" in mu
-                    else InputMediaPhoto(img, caption=caption, filename=fn)
+                    else InputMediaPhoto(img, caption=caption if i == 0 else None, filename=fn)
                 )
-                for img, mu, fn in zip(sub_media, sub_urls, sub_fns, strict=False)
+                for i, (img, mu, fn) in enumerate(zip(sub_media, sub_urls, sub_fns, strict=False))
             ],
         )
-        await message.reply_text(caption)
-        return result
 
     async def _cache_upload_result(self, f: ParsedContent, result: Any) -> None:
         if result is None or not f.media or not f.media.filenames:
