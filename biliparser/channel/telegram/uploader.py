@@ -128,7 +128,8 @@ async def get_media(
                     if is_thumbnail:
                         img = compress(BytesIO(img), size=320, format="JPEG").getvalue()
                     else:
-                        img = compress(BytesIO(img)).getvalue()
+                        # fix_ratio=True 修正超长图比例（宽高比>20会被 Telegram 拒收为 photo）
+                        img = compress(BytesIO(img), fix_ratio=True).getvalue()
                 with temp_media.open("wb") as file:
                     file.write(img)
             else:

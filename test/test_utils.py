@@ -70,5 +70,20 @@ def test_compress_fix_ratio_wide():
     assert w / h <= 20
 
 
+def test_compress_fix_ratio_tall():
+    """超高图应被 pad 到 20:1 比例，且图像内容不能丢失（回归：之前 paste 偏移用错变量导致越界）"""
+    img = Image.new("RGB", (1080, 25967), (200, 100, 50))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG")
+    buf.seek(0)
+    result = compress(buf, size=1280, fix_ratio=True)
+    result.seek(0)
+    out = Image.open(result)
+    w, h = out.size
+    assert h / w <= 20.01
+    # 像素最大值 > 0 说明内容被正确粘贴进画布（越界 bug 会得到全黑/全透明图）
+    assert out.convert("L").getextrema()[1] > 0
+
+
 def test_logger_exists():
     assert logger is not None
