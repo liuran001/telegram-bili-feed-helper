@@ -46,6 +46,12 @@ def test_feed_with_media(client):
     f.mediadimention = {"width": 1920, "height": 1080, "rotate": 0}
     f.mediatitle = "测试视频"
     f.mediaraws = True
+    f.mediafallbackurl = "https://cdn.bilibili.com/fallback.mp4"
+    f.mediafallback_candidates = [
+        "https://cdn.bilibili.com/fallback.mp4",
+        "https://backup.bilibili.com/fallback.mp4",
+    ]
+    f.mediaurl_candidates = [["https://cdn.bilibili.com/video.mp4", "https://backup.bilibili.com/video.mp4"]]
     pc = _feed_to_parsed_content(f)
     assert pc.media is not None
     assert pc.media.type == "video"
@@ -54,6 +60,8 @@ def test_feed_with_media(client):
     assert pc.media.duration == 120
     assert pc.media.title == "测试视频"
     assert pc.media.need_download is True
+    assert pc.media.fallback_candidates == f.mediafallback_candidates
+    assert pc.media.url_candidates == f.mediaurl_candidates
     assert pc.media.dimension["width"] == 1920
 
 

@@ -30,7 +30,9 @@ from biliparser.uploader.download import (
     cleanup_medias,
     get_media,
     get_media_for_content,
+    get_media_from_candidates,
     normalize_media_url,
+    rank_media_urls,
     split_long_image_bytes,
 )
 
@@ -101,6 +103,58 @@ async def test_required_media_download_propagates_httpx_timeout():
             )
 
 
+async def test_upos_candidates_are_ranked_by_parallel_range_probe():
+    class ProbeStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"x" * 1024
+
+    async def probe(request):
+        assert request.headers["Range"] == "bytes=0-1023"
+        await asyncio.sleep(0.005 if request.url.host == "fast.example" else 0.05)
+        return httpx.Response(206, stream=ProbeStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
+        ranked = await rank_media_urls(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            ["https://slow.example/video.m4s", "https://fast.example/video.m4s"],
+            probe_bytes=1024,
+            probe_timeout=1,
+        )
+
+    assert ranked == ["https://fast.example/video.m4s", "https://slow.example/video.m4s"]
+
+
+async def test_upos_download_switches_to_next_candidate_after_failure(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    slow = "https://slow.example/video.m4s"
+    fast = "https://fast.example/video.m4s"
+    attempts = []
+    expected = tmp_path / "video.m4s"
+
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=[slow, fast]))
+
+    async def download_candidate(client, referer, url, filename, **kwargs):
+        attempts.append(url)
+        assert kwargs["raise_on_error"] is True
+        if url == slow:
+            raise httpx.ConnectTimeout("slow UPOS")
+        return expected
+
+    monkeypatch.setattr(download_module, "get_media", download_candidate)
+
+    result = await get_media_from_candidates(
+        MagicMock(),
+        "https://www.bilibili.com/video/BV1test",
+        [slow, fast],
+        "video.m4s",
+    )
+
+    assert result == expected
+    assert attempts == [slow, fast]
+
+
 async def test_dash_failure_uses_mp4_fallback(monkeypatch, tmp_path):
     from biliparser.uploader import download as download_module
 
@@ -114,6 +168,10 @@ async def test_dash_failure_uses_mp4_fallback(monkeypatch, tmp_path):
             need_download=True,
             merge_streams=True,
             fallback_url="https://cdn.example.com/fallback.mp4",
+            fallback_candidates=[
+                "https://cdn.example.com/fallback.mp4",
+                "https://backup.example.com/fallback.mp4",
+            ],
         ),
     )
     fallback_path = tmp_path / "video_merged.mp4"
@@ -121,14 +179,14 @@ async def test_dash_failure_uses_mp4_fallback(monkeypatch, tmp_path):
     async def fail_dash(*args, **kwargs):
         raise httpx.ReadTimeout("slow DASH")
 
-    async def download_fallback(client, referer, url, filename, **kwargs):
-        assert url == content.media.fallback_url
+    async def download_fallback(client, referer, urls, filename, **kwargs):
+        assert urls == content.media.fallback_candidates
         assert filename == "video_merged.mp4"
         assert kwargs["raise_on_error"] is True
         return fallback_path
 
     monkeypatch.setattr(download_module, "handle_dash_media", fail_dash)
-    monkeypatch.setattr(download_module, "get_media", download_fallback)
+    monkeypatch.setattr(download_module, "get_media_from_candidates", download_fallback)
 
     media, thumbnail = await get_media_for_content(content)
 
@@ -137,6 +195,85 @@ async def test_dash_failure_uses_mp4_fallback(monkeypatch, tmp_path):
     assert content.media.urls == [content.media.fallback_url]
     assert content.media.filenames == ["video_merged.mp4"]
     assert content.media.merge_streams is False
+
+
+async def test_dash_download_uses_candidates_for_each_track(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    video_candidates = ["https://video-primary.example/v.m4s", "https://video-backup.example/v.m4s"]
+    audio_candidates = ["https://audio-primary.example/a.m4s", "https://audio-backup.example/a.m4s"]
+    content = ParsedContent(
+        url="https://www.bilibili.com/video/BV1test",
+        author=Author(name="tester"),
+        media=MediaInfo(
+            urls=[video_candidates[0], audio_candidates[0]],
+            url_candidates=[video_candidates, audio_candidates],
+            type="video",
+            filenames=["video.m4s", "audio.m4s"],
+            need_download=True,
+            merge_streams=True,
+        ),
+    )
+    calls = {}
+
+    async def download_candidates(client, referer, urls, filename, **kwargs):
+        calls[filename] = urls
+        path = tmp_path / filename
+        path.write_bytes(b"track")
+        return path
+
+    def merge(cmd, check):
+        assert check is True
+        Path(cmd[-1]).write_bytes(b"merged")
+
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    monkeypatch.setattr(download_module, "get_media_from_candidates", download_candidates)
+    monkeypatch.setattr(download_module.subprocess, "run", merge)
+
+    media, thumbnail = await get_media_for_content(content)
+
+    assert thumbnail is None
+    assert media == [tmp_path / "video_merged.mp4"]
+    assert calls == {"video.m4s": video_candidates, "audio.m4s": audio_candidates}
+    assert content.media.url_candidates == []
+
+
+async def test_dash_cancellation_cleans_track_that_already_finished(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    content = ParsedContent(
+        url="https://www.bilibili.com/video/BV1test",
+        author=Author(name="tester"),
+        media=MediaInfo(
+            urls=["https://video.example/v.m4s", "https://audio.example/a.m4s"],
+            type="video",
+            filenames=["video.m4s", "audio.m4s"],
+            need_download=True,
+            merge_streams=True,
+        ),
+    )
+    audio_path = tmp_path / "audio.m4s"
+    audio_finished = asyncio.Event()
+    video_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def download_track(client, referer, urls, filename, **kwargs):
+        if filename == "audio.m4s":
+            audio_path.write_bytes(b"audio")
+            audio_finished.set()
+            return audio_path
+        video_started.set()
+        await never.wait()
+
+    monkeypatch.setattr(download_module, "get_media_from_candidates", download_track)
+
+    running = asyncio.create_task(download_module.handle_dash_media(content, MagicMock()))
+    await asyncio.wait_for(asyncio.gather(audio_finished.wait(), video_started.wait()), timeout=1)
+    running.cancel()
+    await asyncio.gather(running, return_exceptions=True)
+
+    assert running.cancelled()
+    assert not audio_path.exists()
 
 
 async def test_dash_failure_without_fallback_propagates(monkeypatch):

@@ -12,6 +12,8 @@ import asyncio
 import math
 import os
 import subprocess
+import sys
+import time
 from collections.abc import Callable, Coroutine
 from io import BytesIO
 from pathlib import Path
@@ -35,6 +37,9 @@ FILE_CONNECT_TIMEOUT = float(os.environ.get("FILE_CONNECT_TIMEOUT", 30))
 FILE_READ_TIMEOUT = float(os.environ.get("FILE_READ_TIMEOUT", 60))
 FILE_WRITE_TIMEOUT = float(os.environ.get("FILE_WRITE_TIMEOUT", 60))
 FILE_POOL_TIMEOUT = float(os.environ.get("FILE_POOL_TIMEOUT", 30))
+UPOS_PROBE_BYTES = int(os.environ.get("UPOS_PROBE_BYTES", 2 * 1024 * 1024))
+UPOS_PROBE_TIMEOUT = float(os.environ.get("UPOS_PROBE_TIMEOUT", 10))
+DOWNLOAD_PROGRESS_INTERVAL = float(os.environ.get("DOWNLOAD_PROGRESS_INTERVAL", 15))
 
 CacheLookup = Callable[[str], Coroutine[None, None, str | None]]
 CacheKeyBuilder = Callable[[str, str | None, Path | str | None, bool], str]
@@ -49,6 +54,19 @@ def normalize_media_url(url: str) -> str:
     ):
         return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
     return url
+
+
+def _media_url_host(url: str) -> str:
+    return urlsplit(url).hostname or url
+
+
+def _display_media_url(url: str) -> str:
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _dedupe_media_urls(urls: list[str]) -> list[str]:
+    return list(dict.fromkeys(normalize_media_url(url) for url in urls if url))
 
 
 def cleanup_medias(medias) -> None:
@@ -86,7 +104,7 @@ async def get_media(
         header = BILIBILI_DESKTOP_HEADER.copy()
         header["Referer"] = referer
         async with timeout(CACHES_TIMER["LOCK"]), client.stream("GET", url, headers=header) as response:
-            logger.info(f"下载开始: {url}")
+            logger.info(f"下载开始: {_display_media_url(url)} -> {filename}")
             if response.status_code != 200:
                 raise httpx.HTTPStatusError(
                     f"媒体文件获取错误: {response.status_code} {url}->{referer}",
@@ -102,6 +120,9 @@ async def get_media(
                 )
             mediatype = content_type.split("/")
             total = int(response.headers.get("content-length", 0))
+            downloaded = 0
+            download_started = time.monotonic()
+            last_progress = download_started
             if mediatype[0] in ["video", "audio", "application"]:
                 with (
                     temp_media.open("wb") as file,
@@ -111,13 +132,25 @@ async def get_media(
                         unit_divisor=1024,
                         unit="B",
                         desc=response.request.url.host + "->" + filename,
+                        disable=not sys.stderr.isatty(),
                     ) as pbar,
                 ):
                     async for chunk in response.aiter_bytes():
                         file.write(chunk)
+                        downloaded += len(chunk)
                         pbar.update(len(chunk))
+                        now = time.monotonic()
+                        if DOWNLOAD_PROGRESS_INTERVAL > 0 and now - last_progress >= DOWNLOAD_PROGRESS_INTERVAL:
+                            elapsed = max(now - download_started, 0.001)
+                            speed = downloaded / elapsed / (1024 * 1024)
+                            progress = f"{downloaded / (1024 * 1024):.1f} MiB"
+                            if total:
+                                progress = f"{downloaded / total:.1%} ({progress}/{total / (1024 * 1024):.1f} MiB)"
+                            logger.info(f"下载进度: {filename} {progress}, 平均 {speed:.1f} MiB/s")
+                            last_progress = now
             elif media_check_ignore or mediatype[0] == "image":
                 img = await response.aread()
+                downloaded = len(img)
                 if not is_thumbnail and compression and mediatype[1] in ["jpeg", "png"]:
                     pieces = split_long_image_bytes(img)
                     if pieces:
@@ -143,21 +176,134 @@ async def get_media(
                 raise ValueError(f"媒体文件类型错误: {mediatype} {url}->{referer}")
             media.unlink(missing_ok=True)
             temp_media.rename(media)
-            logger.info(f"完成下载: {media}")
+            elapsed = max(time.monotonic() - download_started, 0.001)
+            logger.info(
+                f"完成下载: {media} ({downloaded / (1024 * 1024):.1f} MiB, "
+                f"平均 {downloaded / elapsed / (1024 * 1024):.1f} MiB/s)"
+            )
             return media
     except (asyncio.TimeoutError, httpx.TimeoutException) as err:
-        logger.error(f"下载超时: {url}->{referer}")
+        logger.error(f"下载超时: {_display_media_url(url)}->{referer}")
         if raise_on_error:
             if isinstance(err, httpx.TimeoutException):
                 raise
             raise httpx.TimeoutException(f"下载超时: {url}") from err
     except Exception as e:
-        logger.error(f"下载错误: {url}->{referer}")
+        logger.error(f"下载错误: {_display_media_url(url)}->{referer}")
         logger.exception(e)
         if raise_on_error:
             raise
     finally:
         temp_media.unlink(missing_ok=True)
+
+
+async def _probe_media_url(
+    client: httpx.AsyncClient,
+    referer: str,
+    url: str,
+    probe_bytes: int,
+    probe_timeout: float,
+) -> tuple[str, float] | None:
+    header = BILIBILI_DESKTOP_HEADER.copy()
+    header["Referer"] = referer
+    header["Range"] = f"bytes=0-{probe_bytes - 1}"
+    header["Accept-Encoding"] = "identity"
+    downloaded = 0
+    started = time.monotonic()
+    try:
+        async with timeout(probe_timeout), client.stream("GET", url, headers=header) as response:
+            if response.status_code not in (200, 206):
+                return None
+            async for chunk in response.aiter_raw():
+                downloaded += len(chunk)
+                if downloaded >= probe_bytes:
+                    break
+    except asyncio.TimeoutError:
+        pass
+    except httpx.HTTPError:
+        return None
+    except Exception as err:
+        logger.debug(f"UPOS测速失败: {_media_url_host(url)} ({type(err).__name__})")
+        return None
+    elapsed = max(time.monotonic() - started, 0.001)
+    return (url, downloaded / elapsed) if downloaded else None
+
+
+async def rank_media_urls(
+    client: httpx.AsyncClient,
+    referer: str,
+    urls: list[str],
+    *,
+    probe_bytes: int = UPOS_PROBE_BYTES,
+    probe_timeout: float = UPOS_PROBE_TIMEOUT,
+) -> list[str]:
+    """并发小范围测速，成功候选按实际吞吐排序，探测失败候选保留在末尾供兜底。"""
+    candidates = _dedupe_media_urls(urls)
+    if len(candidates) < 2 or probe_bytes <= 0 or probe_timeout <= 0:
+        return candidates
+
+    results = await asyncio.gather(
+        *(_probe_media_url(client, referer, url, probe_bytes, probe_timeout) for url in candidates)
+    )
+    speeds = {result[0]: result[1] for result in results if result is not None}
+    if not speeds:
+        logger.warning(f"UPOS测速均失败，按原顺序尝试: {', '.join(_media_url_host(url) for url in candidates)}")
+        return candidates
+
+    ranked = sorted(speeds, key=lambda url: speeds[url], reverse=True)
+    ranked.extend(url for url in candidates if url not in speeds)
+    summary = ", ".join(f"{_media_url_host(url)}={speeds[url] / (1024 * 1024):.1f} MiB/s" for url in speeds)
+    logger.info(f"UPOS并发测速: {summary}; 选择 {_media_url_host(ranked[0])}")
+    return ranked
+
+
+async def get_media_from_candidates(
+    client: httpx.AsyncClient,
+    referer: str,
+    urls: list[str],
+    filename: str,
+    compression: bool = True,
+    media_check_ignore: bool = False,
+    no_cache: bool = False,
+    is_thumbnail: bool = False,
+    cache_lookup: CacheLookup | None = None,
+    cache_key: str | None = None,
+    raise_on_error: bool = False,
+) -> Path | str | list[Path] | None:
+    """测速选择最快候选；完整下载失败时自动从下一个 UPOS 重新下载。"""
+    if not no_cache and cache_lookup is not None:
+        file_id = await cache_lookup(cache_key or filename)
+        if file_id:
+            return file_id
+
+    ranked = await rank_media_urls(client, referer, urls)
+    last_error: Exception | None = None
+    for index, url in enumerate(ranked):
+        try:
+            result = await get_media(
+                client,
+                referer,
+                url,
+                filename,
+                compression=compression,
+                media_check_ignore=media_check_ignore,
+                no_cache=True,
+                is_thumbnail=is_thumbnail,
+                raise_on_error=True,
+            )
+            if result:
+                return result
+        except Exception as err:
+            last_error = err
+            next_host = _media_url_host(ranked[index + 1]) if index + 1 < len(ranked) else None
+            suffix = f"，切换到 {next_host}" if next_host else ""
+            logger.warning(f"UPOS下载失败: {_media_url_host(url)} ({type(err).__name__}){suffix}")
+
+    if raise_on_error:
+        if last_error:
+            raise last_error
+        raise httpx.RequestError(f"所有 UPOS 候选均下载失败: {referer}")
+    return None
 
 
 def split_long_image_bytes(
@@ -207,13 +353,18 @@ def expand_long_images(content: ParsedContent, media: list) -> list:
     new_media: list = []
     new_urls: list = []
     new_filenames: list = []
+    new_candidates: list[list[str]] = []
     for index, item in enumerate(media):
         url = content.media.urls[index] if index < len(content.media.urls) else ""
         filename = content.media.filenames[index] if index < len(content.media.filenames) else ""
+        candidates = (
+            content.media.url_candidates[index] if index < len(content.media.url_candidates) else ([url] if url else [])
+        )
         if isinstance(item, list):
             for piece_index, piece in enumerate(item):
                 new_media.append(piece)
                 new_urls.append(url)
+                new_candidates.append(candidates)
                 new_filenames.append(
                     f"{Path(filename).stem or 'image'}_p{piece_index + 1}.jpg"
                     if filename
@@ -222,15 +373,24 @@ def expand_long_images(content: ParsedContent, media: list) -> list:
         else:
             new_media.append(item)
             new_urls.append(url)
+            new_candidates.append(candidates)
             new_filenames.append(filename)
     content.media.urls = new_urls
     content.media.filenames = new_filenames
+    content.media.url_candidates = new_candidates
     return new_media
 
 
 def _merged_media_filename(content: ParsedContent) -> str:
     base_name = content.media.filenames[0] if content.media and content.media.filenames else "merged"
     return f"{Path(base_name).stem}_merged.mp4"
+
+
+def _content_media_candidates(content: ParsedContent, index: int, primary: str) -> list[str]:
+    candidates = (
+        content.media.url_candidates[index] if content.media and index < len(content.media.url_candidates) else []
+    )
+    return _dedupe_media_urls([primary, *candidates])
 
 
 async def handle_dash_media(
@@ -246,6 +406,7 @@ async def handle_dash_media(
     if len(f.media.urls) < 2:
         raise httpx.RequestError(f"DASH媒体轨道不足: {f.url}")
     res = []
+    download_tasks: list[asyncio.Task] = []
     try:
         # Use a distinct merged filename to avoid ffmpeg reading and writing the same file
         merged_name = _merged_media_filename(f)
@@ -261,22 +422,25 @@ async def handle_dash_media(
             if cache_dash:
                 f.media.urls = [str(cache_dash_file.absolute())]
                 f.media.filenames = [cache_dash_file.name]
+                f.media.url_candidates = []
                 f.media.merge_streams = False
                 return [cache_dash]
 
-        tasks = [
-            get_media(
-                client,
-                f.url,
-                media_url,
-                filename,
-                no_cache=True,
-                cache_lookup=cache_lookup,
-                raise_on_error=True,
+        download_tasks = [
+            asyncio.create_task(
+                get_media_from_candidates(
+                    client,
+                    f.url,
+                    _content_media_candidates(f, index, media_url),
+                    filename,
+                    no_cache=True,
+                    cache_lookup=cache_lookup,
+                    raise_on_error=True,
+                )
             )
-            for media_url, filename in zip(f.media.urls, f.media.filenames, strict=False)
+            for index, (media_url, filename) in enumerate(zip(f.media.urls, f.media.filenames, strict=False))
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*download_tasks, return_exceptions=True)
         failures = [result for result in results if isinstance(result, Exception)]
         res = [result for result in results if result and not isinstance(result, BaseException)]
         if failures:
@@ -295,6 +459,7 @@ async def handle_dash_media(
 
         f.media.urls = [str(cache_dash_file.absolute())]
         f.media.filenames = [cache_dash_file.name]
+        f.media.url_candidates = []
         f.media.merge_streams = False
         logger.debug(f"合并完成: {f.url}")
         return [cache_dash_file]
@@ -302,7 +467,11 @@ async def handle_dash_media(
         logger.error(f"DASH媒体处理失败: {f.url} - {e!s}")
         raise httpx.RequestError(f"DASH媒体合并失败: {f.url}") from e
     finally:
-        for item in res:
+        for task in download_tasks:
+            if not task.done():
+                task.cancel()
+        completed = await asyncio.gather(*download_tasks, return_exceptions=True)
+        for item in completed:
             if isinstance(item, Path):
                 item.unlink(missing_ok=True)
 
@@ -370,10 +539,10 @@ async def get_media_for_content(
                 logger.warning(f"DASH媒体下载失败，改用 MP4 直链: {f.url} - {err}")
                 fallback_url = f.media.fallback_url
                 fallback_filename = _merged_media_filename(f)
-                fallback = await get_media(
+                fallback = await get_media_from_candidates(
                     client,
                     f.url,
-                    fallback_url,
+                    _dedupe_media_urls([fallback_url, *f.media.fallback_candidates]),
                     fallback_filename,
                     compression=compression,
                     media_check_ignore=media_check_ignore,
@@ -385,6 +554,8 @@ async def get_media_for_content(
                     raise httpx.RequestError(f"MP4 回退媒体下载失败: {f.url}") from err
                 f.media.urls = [fallback_url]
                 f.media.filenames = [fallback_filename]
+                f.media.url_candidates = []
+                f.media.fallback_candidates = []
                 f.media.merge_streams = False
                 media = [fallback]
             if media:
@@ -394,10 +565,10 @@ async def get_media_for_content(
             # 不能静默过滤成空列表后继续调用平台上传接口。
             required_media = media_check_ignore or f.media.type in ["video", "audio"]
             tasks = [
-                get_media(
+                get_media_from_candidates(
                     client,
                     f.url,
-                    media_url,
+                    _content_media_candidates(f, index, media_url),
                     fn,
                     compression=compression,
                     media_check_ignore=media_check_ignore,
@@ -407,23 +578,22 @@ async def get_media_for_content(
                     ),
                     raise_on_error=required_media,
                 )
-                for media_url, fn in zip(f.media.urls, f.media.filenames, strict=False)
+                for index, (media_url, fn) in enumerate(zip(f.media.urls, f.media.filenames, strict=False))
             ]
             downloaded = await asyncio.gather(*tasks, return_exceptions=True)
             failures = [item for item in downloaded if isinstance(item, Exception)]
             kept_urls: list = []
             kept_filenames: list = []
+            kept_candidates: list[list[str]] = []
             media = []
-            for item, media_url, filename in zip(
-                downloaded,
-                f.media.urls,
-                f.media.filenames,
-                strict=False,
+            for index, (item, media_url, filename) in enumerate(
+                zip(downloaded, f.media.urls, f.media.filenames, strict=False)
             ):
                 if item and not isinstance(item, BaseException):
                     media.append(item)
                     kept_urls.append(media_url)
                     kept_filenames.append(filename)
+                    kept_candidates.append(_content_media_candidates(f, index, media_url))
             if required_media and (failures or not media):
                 cleanup_medias(media)
                 if failures:
@@ -431,6 +601,7 @@ async def get_media_for_content(
                 raise httpx.RequestError(f"媒体下载失败: {f.url}")
             f.media.urls = kept_urls
             f.media.filenames = kept_filenames
+            f.media.url_candidates = kept_candidates
             media = expand_long_images(f, media)
         else:
             if f.media.type in ["video", "audio"]:

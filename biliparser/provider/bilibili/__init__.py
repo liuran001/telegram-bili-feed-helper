@@ -76,6 +76,8 @@ def _feed_to_parsed_content(f: Feed) -> ParsedContent:
             need_download=f.mediaraws,
             merge_streams=f.mediamerge,
             fallback_url=f.mediafallbackurl,
+            fallback_candidates=f.mediafallback_candidates,
+            url_candidates=f.mediaurl_candidates,
         )
 
     comments: list[Comment] = []

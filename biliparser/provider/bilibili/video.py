@@ -41,6 +41,57 @@ def _resolve_video_codec(name: str) -> video.VideoCodecs:
         return video.VideoCodecs[enum_name]
 
 
+def _dedupe_urls(urls) -> list[str]:
+    return list(dict.fromkeys(url for url in urls if isinstance(url, str) and url))
+
+
+def _dash_stream_candidates(dash_data: dict, selected_stream, kind: str) -> list[str]:
+    """从原始 playurl 响应恢复 detector 丢弃的主/备 UPOS URL。"""
+    dash = dash_data.get("dash") or {}
+    entries = list(dash.get(kind) or [])
+    if kind == "audio":
+        dolby_audio = (dash.get("dolby") or {}).get("audio") or []
+        flac_audio = (dash.get("flac") or {}).get("audio") or []
+        entries.extend(dolby_audio if isinstance(dolby_audio, list) else [dolby_audio])
+        entries.extend(flac_audio if isinstance(flac_audio, list) else [flac_audio])
+
+    selected_url = selected_stream.url
+    quality = selected_stream.video_quality if kind == "video" else selected_stream.audio_quality
+    codec = getattr(selected_stream, "video_codecs", None)
+    codec_prefix = codec.value if codec else ""
+
+    exact = []
+    compatible = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        primary = entry.get("baseUrl") or entry.get("base_url")
+        if primary == selected_url:
+            exact.append(entry)
+            continue
+        if entry.get("id") != quality.value:
+            continue
+        if kind == "video" and codec_prefix and not str(entry.get("codecs", "")).startswith(codec_prefix):
+            continue
+        compatible.append(entry)
+
+    entry = next(iter(exact or compatible), None)
+    if not entry:
+        return [selected_url]
+
+    backup_camel = entry.get("backupUrl") or []
+    backup_snake = entry.get("backup_url") or []
+    if isinstance(backup_camel, str):
+        backup_camel = [backup_camel]
+    if isinstance(backup_snake, str):
+        backup_snake = [backup_snake]
+    return _dedupe_urls([selected_url, entry.get("baseUrl"), entry.get("base_url"), *backup_camel, *backup_snake])
+
+
+def _prioritize_url(selected: str, candidates: list[str]) -> list[str]:
+    return _dedupe_urls([selected, *candidates])
+
+
 class Video(Feed):
     cidcontent: dict = {}
     epcontent: dict = {}
@@ -144,19 +195,18 @@ class Video(Feed):
             and video_result.get("data").get("durl")[0].get("size") < size_limit
         ):
             url = video_result["data"]["durl"][0]["url"]
-            result, url = await self.test_url_status_code(url, self.url)
-            if not result and video_result["data"]["durl"][0].get("backup_url", None):
-                backup_urls = video_result["data"]["durl"][0]["backup_url"]
-                for item in backup_urls:
-                    url = item
-                    result, item = await self.test_url_status_code(item, self.url)
-                    if result:
-                        break
+            backup_urls = video_result["data"]["durl"][0].get("backup_url") or []
+            if isinstance(backup_urls, str):
+                backup_urls = [backup_urls]
+            candidates = _dedupe_urls([url, *backup_urls])
+            result, url = await self.test_url_status_code(candidates, self.url)
             if result:
                 self.mediacontent = video_result
                 self.mediaduration = round(video_result["data"]["durl"][0]["length"] / 1000)
                 self.mediaurls = url
+                self.mediaurl_candidates = [_prioritize_url(url, candidates)]
                 self.mediafallbackurl = url
+                self.mediafallback_candidates = _prioritize_url(url, candidates)
                 self.mediatype = "video"
                 self.mediaraws = False
                 self.mediafilesize = video_result.get("data").get("durl")[0].get("size")
@@ -204,10 +254,13 @@ class Video(Feed):
             stream_dimensions[(rv.get("id"), rv.get("codecs", ""))] = (rv.get("width", 0), rv.get("height", 0))
         audio_url = None
         audio_size = 0
+        audio_candidates = []
         for audio_stream in audio_streams:
-            audio_size, audio_stream.url = await self.test_url_status_code(audio_stream.url, self.url)
+            candidates = _dash_stream_candidates(dash_data, audio_stream, "audio")
+            audio_size, audio_stream.url = await self.test_url_status_code(candidates, self.url)
             if audio_size:
                 audio_url = audio_stream.url
+                audio_candidates = _prioritize_url(audio_url, candidates)
                 break
         if not audio_url:
             logger.error(f"无可用Dash视频音频流清晰度: {streams}")
@@ -222,7 +275,8 @@ class Video(Feed):
                 # 没有任何流满足上限（极少见），退回到 detect 的最低档
                 capped = sorted(video_streams, key=lambda x: x.video_quality.value)[:1]
             video_stream = capped[0]
-            video_size, video_stream.url = await self.test_url_status_code(video_stream.url, self.url)
+            video_candidates = _dash_stream_candidates(dash_data, video_stream, "video")
+            video_size, video_stream.url = await self.test_url_status_code(video_candidates, self.url)
             if not video_size:
                 logger.error(f"无可用Dash视频流清晰度: {streams}")
                 return False
@@ -234,18 +288,33 @@ class Video(Feed):
                     self.url,
                 )
             logger.info(f"选择Dash视频清晰度(指定):{video_stream.video_quality.name} 大小:{video_size}")
-            self.__commit_dash_media(video_stream, audio_url, total_size, dash_duration, stream_dimensions)
+            self.__commit_dash_media(
+                video_stream,
+                audio_url,
+                total_size,
+                dash_duration,
+                stream_dimensions,
+                _prioritize_url(video_stream.url, video_candidates),
+                audio_candidates,
+            )
             return True
         # 自动模式：从高到低逐档检查体积，选取首个不超过降档阈值的画质
         # VIDEO_DOWNGRADE_SIZE 未配置时回退到 VIDEO_SIZE_LIMIT，保持旧行为
         downgrade_env = os.environ.get("VIDEO_DOWNGRADE_SIZE")
         downgrade_limit = int(downgrade_env) if downgrade_env else hard_limit
         for video_stream in video_streams:
-            video_size, video_stream.url = await self.test_url_status_code(video_stream.url, self.url)
+            video_candidates = _dash_stream_candidates(dash_data, video_stream, "video")
+            video_size, video_stream.url = await self.test_url_status_code(video_candidates, self.url)
             if audio_size and video_size and (audio_size + video_size < downgrade_limit):
                 logger.info(f"选择Dash视频清晰度:{video_stream.video_quality.name} 大小:{video_size}")
                 self.__commit_dash_media(
-                    video_stream, audio_url, audio_size + video_size, dash_duration, stream_dimensions
+                    video_stream,
+                    audio_url,
+                    audio_size + video_size,
+                    dash_duration,
+                    stream_dimensions,
+                    _prioritize_url(video_stream.url, video_candidates),
+                    audio_candidates,
                 )
                 return True
         # 所有画质（含最低档）均超过降档阈值。仅当用户显式配置了 VIDEO_DOWNGRADE_SIZE
@@ -257,9 +326,19 @@ class Video(Feed):
             logger.error(f"无可用Dash视频流清晰度: {streams}")
         return False
 
-    def __commit_dash_media(self, video_stream, audio_url, total_size, dash_duration, stream_dimensions):
+    def __commit_dash_media(
+        self,
+        video_stream,
+        audio_url,
+        total_size,
+        dash_duration,
+        stream_dimensions,
+        video_candidates,
+        audio_candidates,
+    ):
         """将选定的 DASH 视频/音频轨写入媒体字段，并使用实际流分辨率设置尺寸。"""
         self.mediaurls = [video_stream.url, audio_url]
+        self.mediaurl_candidates = [video_candidates, audio_candidates]
         self.mediatype = "video"
         self.mediaraws = True
         self.mediamerge = True
@@ -532,5 +611,7 @@ class Video(Feed):
             self.mediaraws = False
             self.mediamerge = False
             self.mediafallbackurl = ""
+            self.mediafallback_candidates = []
+            self.mediaurl_candidates = []
             self.mediafilesize = 0
         return self

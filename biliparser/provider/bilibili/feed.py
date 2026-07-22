@@ -30,6 +30,8 @@ class Feed(ABC):
     mediamerge: bool = False  # 多轨流需要合并（如 DASH 视频轨+音频轨）
     mediatype: str = ""
     mediafallbackurl: str = ""  # MP4 直链，供无法合并 DASH 的 Channel（如 inline）使用
+    mediafallback_candidates: list[str] = []
+    mediaurl_candidates: list[list[str]] = []  # 与 mediaurls 对齐的主/备 UPOS URL
     __mediathumb: str = ""
     mediaduration: int = 0
     mediadimention: dict = {"width": 0, "height": 0, "rotate": 0}
@@ -41,20 +43,22 @@ class Feed(ABC):
     def __init__(self, rawurl: str, client: httpx.AsyncClient):
         self.rawurl = rawurl
         self.client = client
+        self.mediafallback_candidates = []
+        self.mediaurl_candidates = []
 
     async def test_url_status_code(self, url, referer):
         header = BILIBILI_DESKTOP_HEADER.copy()
         header["Referer"] = referer
-        select_urls = [url]
+        source_urls = [url] if isinstance(url, str) else list(url)
+        select_urls = []
         upos_domain = os.environ.get("UPOS_DOMAIN")
         if upos_domain:
-            domains = upos_domain.split(",")
-            if domains:
-                random.shuffle(domains)
-                domain = domains.pop()
-                if domain:
-                    test_url = re.sub(r"https?://[^/]+/", f"https://{domain}/", url)
-                    select_urls.insert(0, test_url)
+            domains = [domain.strip() for domain in upos_domain.split(",") if domain.strip()]
+            random.shuffle(domains)
+            for source_url in source_urls:
+                select_urls.extend(re.sub(r"https?://[^/]+/", f"https://{domain}/", source_url) for domain in domains)
+        select_urls.extend(source_urls)
+        select_urls = list(dict.fromkeys(select_urls))
         for select_url in select_urls:
             try:
                 select_url = re.sub(r"&buvid=[^&]+", "&buvid=", select_url)  ## 清除buvid参数
@@ -65,7 +69,7 @@ class Feed(ABC):
             except Exception as e:
                 logger.error(f"下载链接测试错误: {url}->{referer}")
                 logger.exception(e)
-        return 0, url
+        return 0, source_urls[0]
 
     @staticmethod
     def make_user_markdown(user, uid):

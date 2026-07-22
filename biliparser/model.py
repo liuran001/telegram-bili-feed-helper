@@ -30,6 +30,9 @@ class MediaInfo:
     merge_streams: bool = False  # True 表示 urls 中的多个轨道需要下载后合并（如 DASH 视频轨+音频轨）
     # 直接可播的 MP4 直链；DASH 模式下 urls 是分离流，inline 等无法合并的 Channel 用这个
     fallback_url: str = ""
+    fallback_candidates: list[str] = field(default_factory=list)
+    # 与 urls 按索引对齐的同源 CDN 候选；首项为首选 URL，其余为 API 提供的 backupUrl。
+    url_candidates: list[list[str]] = field(default_factory=list)
 
 
 @dataclass
