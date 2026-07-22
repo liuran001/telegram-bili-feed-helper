@@ -12,9 +12,9 @@ from PIL import Image
 LOCAL_FILE_PATH = Path(os.environ.get("LOCAL_TEMP_FILE_PATH", str(Path.cwd())))
 
 logger.remove()
-logger.add(sys.stdout, backtrace=True, diagnose=True)
+logger.add(sys.stdout, backtrace=True, diagnose=False)
 if os.environ.get("LOG_TO_FILE"):
-    logger.add("bili_feed.log", backtrace=True, diagnose=True, rotation="1 MB")
+    logger.add("bili_feed.log", backtrace=True, diagnose=False, rotation="1 MB")
 
 
 def compress(inpil, size=1280, fix_ratio=False, format="PNG") -> BytesIO:

@@ -1,6 +1,9 @@
 """测试共享下载层与 Telegram 上传队列的合并行为。"""
 
 import asyncio
+import os
+import subprocess
+import sys
 import tempfile
 from io import BytesIO
 from pathlib import Path
@@ -194,6 +197,111 @@ async def test_media_client_receives_configured_timeout(monkeypatch):
     await get_media_for_content(content)
 
     assert captured["timeout"].read == FILE_READ_TIMEOUT
+
+
+async def test_fetch_image_download_failure_propagates_for_queue_retry(monkeypatch):
+    """``/fetch`` 下载原文件失败时必须抛出网络异常，不能过滤成空媒体列表。"""
+    from biliparser.uploader import download as download_module
+
+    content = ParsedContent(
+        url="https://t.bilibili.com/123",
+        author=Author(name="tester"),
+        media=MediaInfo(
+            urls=["https://i0.hdslb.com/bfs/new_dyn/image.png"],
+            type="image",
+            filenames=["image.png"],
+            need_download=True,
+        ),
+    )
+
+    async def fail_download(*args, raise_on_error=False, **kwargs):
+        assert raise_on_error is True
+        raise httpx.ConnectTimeout("slow CDN")
+
+    monkeypatch.setattr(download_module, "get_media", fail_download)
+
+    with pytest.raises(httpx.ConnectTimeout):
+        await get_media_for_content(content, media_check_ignore=True)
+
+
+async def test_fetch_never_sends_empty_media_group(monkeypatch):
+    """下载层意外返回空结果时，fetch 应抛出可重试错误而非调用 media=[]。"""
+    from biliparser.channel.telegram import uploader as uploader_module
+
+    class Lock:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    cache = MagicMock()
+    cache.lock.return_value = Lock()
+    monkeypatch.setattr(uploader_module, "RedisCache", lambda: cache)
+    monkeypatch.setattr(uploader_module, "get_media_for_content", AsyncMock(return_value=([], None)))
+
+    content = ParsedContent(
+        url="https://t.bilibili.com/123",
+        author=Author(name="tester"),
+        media=MediaInfo(
+            urls=["https://i0.hdslb.com/bfs/new_dyn/image.png"],
+            type="image",
+            filenames=["image.png"],
+            need_download=True,
+        ),
+    )
+    message = MagicMock()
+    message.reply_media_group = AsyncMock()
+    task = TelegramUploadTask(
+        user_id=1,
+        context=message,
+        message=message,
+        parsed_content=content,
+        media=[],
+        mediathumb=None,
+        urls=[content.url],
+        task_type="fetch",
+        fetch_mode="file",
+    )
+
+    with pytest.raises(httpx.RequestError, match="未下载到可发送的媒体"):
+        await _manager()._process_fetch_task(task)
+
+    message.reply_media_group.assert_not_awaited()
+
+
+def test_exception_logging_does_not_render_sensitive_object_repr(tmp_path):
+    """生产异常栈不应通过 Loguru 变量诊断展开 Bot token 等对象内容。"""
+    sentinel = "SECRET_TOKEN_SENTINEL_7f9a"
+    script = tmp_path / "loguru_diagnose_probe.py"
+    script.write_text(
+        f'''from biliparser.utils import logger
+
+class SensitiveObject:
+    def __repr__(self):
+        return "{sentinel}"
+
+def crash(value):
+    return value.missing_attribute
+
+try:
+    crash(SensitiveObject())
+except AttributeError:
+    logger.exception("expected test exception")
+''',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(script)],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "PYTHONPATH": str(Path.cwd())},
+    )
+
+    assert sentinel not in result.stdout + result.stderr
 
 
 def test_cleanup_medias_paths():

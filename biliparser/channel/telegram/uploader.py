@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
 from telegram import InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
 from telegram.constants import ChatType
 from telegram.error import BadRequest, NetworkError, RetryAfter
@@ -291,6 +292,9 @@ class TelegramUploadQueueManager(UploadQueueManager):
                 else:
                     mediafilenames = f.media.filenames
 
+                if not medias:
+                    raise httpx.RequestError(f"fetch 未下载到可发送的媒体: {f.url}")
+
                 if len(medias) == 1:
                     result = await message.reply_document(
                         document=medias[0],
@@ -323,7 +327,7 @@ class TelegramUploadQueueManager(UploadQueueManager):
                         else:
                             await cache_media(filename, attachment, "document")
         except Exception as err:
-            logger.exception(f"fetch 任务失败: {err} - {f.url}")
+            logger.error(f"fetch 任务失败: {type(err).__name__}: {err} - {f.url}")
             raise  # 让 _try_upload_once 的错误处理感知到失败
         finally:
             cleanup_medias(medias)

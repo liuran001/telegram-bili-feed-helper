@@ -145,9 +145,11 @@ async def get_media(
             temp_media.rename(media)
             logger.info(f"完成下载: {media}")
             return media
-    except asyncio.TimeoutError as err:
+    except (asyncio.TimeoutError, httpx.TimeoutException) as err:
         logger.error(f"下载超时: {url}->{referer}")
         if raise_on_error:
+            if isinstance(err, httpx.TimeoutException):
+                raise
             raise httpx.TimeoutException(f"下载超时: {url}") from err
     except Exception as e:
         logger.error(f"下载错误: {url}->{referer}")
@@ -343,6 +345,7 @@ async def get_media_for_content(
                     no_cache=True,
                     is_thumbnail=True,
                     cache_lookup=cache_lookup,
+                    raise_on_error=media_check_ignore,
                 )
             else:
                 mediathumb = referer_url(f.media.thumbnail, f.url)
@@ -387,7 +390,9 @@ async def get_media_for_content(
             if media:
                 return media, mediathumb
         elif f.media.need_download or LOCAL_MODE:
-            required_media = f.media.type in ["video", "audio"]
+            # video/audio 以及 /fetch 原文件都必须完整下载；失败需交给上传队列重试，
+            # 不能静默过滤成空列表后继续调用平台上传接口。
+            required_media = media_check_ignore or f.media.type in ["video", "audio"]
             tasks = [
                 get_media(
                     client,
