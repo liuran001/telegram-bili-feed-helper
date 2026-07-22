@@ -11,10 +11,12 @@ cache_lookup: 可选的缓存查询函数，签名为 async (filename: str) -> s
 import asyncio
 import math
 import os
+import re
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -40,9 +42,39 @@ FILE_POOL_TIMEOUT = float(os.environ.get("FILE_POOL_TIMEOUT", 30))
 UPOS_PROBE_BYTES = int(os.environ.get("UPOS_PROBE_BYTES", 2 * 1024 * 1024))
 UPOS_PROBE_TIMEOUT = float(os.environ.get("UPOS_PROBE_TIMEOUT", 10))
 DOWNLOAD_PROGRESS_INTERVAL = float(os.environ.get("DOWNLOAD_PROGRESS_INTERVAL", 15))
+FILE_RANGE_WORKERS = int(os.environ.get("FILE_RANGE_WORKERS", 4))
+FILE_RANGE_MAX_WORKERS = int(os.environ.get("FILE_RANGE_MAX_WORKERS", 16))
+FILE_RANGE_CHUNK_SIZE = int(os.environ.get("FILE_RANGE_CHUNK_SIZE", 8 * 1024 * 1024))
+FILE_RANGE_MAX_CHUNK_SIZE = int(os.environ.get("FILE_RANGE_MAX_CHUNK_SIZE", 64 * 1024 * 1024))
+FILE_RANGE_MIN_SIZE = int(os.environ.get("FILE_RANGE_MIN_SIZE", 32 * 1024 * 1024))
+FILE_RANGE_RETRIES = int(os.environ.get("FILE_RANGE_RETRIES", 2))
+FILE_RANGE_CHUNKS_PER_WORKER = int(os.environ.get("FILE_RANGE_CHUNKS_PER_WORKER", 16))
+FILE_RANGE_MAX_CHUNKS = int(os.environ.get("FILE_RANGE_MAX_CHUNKS", 4096))
+FILE_RANGE_MAX_SIZE = int(os.environ.get("FILE_RANGE_MAX_SIZE", 2 * 1024 * 1024 * 1024))
+FILE_RANGE_REQUEST_TIMEOUT = float(os.environ.get("FILE_RANGE_REQUEST_TIMEOUT", 30))
+FILE_RANGE_HEDGE_DELAY = float(os.environ.get("FILE_RANGE_HEDGE_DELAY", 15))
 
 CacheLookup = Callable[[str], Coroutine[None, None, str | None]]
 CacheKeyBuilder = Callable[[str, str | None, Path | str | None, bool], str]
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$", re.IGNORECASE)
+_STRONG_ETAG_RE = re.compile(r'^"[\x21\x23-\x7e\x80-\xff]*"$')
+
+
+@dataclass(frozen=True)
+class _RangeSource:
+    url: str
+    total: int
+    content_type: str
+    etag: str = ""
+
+    @property
+    def strong_etag(self) -> str:
+        etag = self.etag.strip()
+        return etag if _STRONG_ETAG_RE.fullmatch(etag) else ""
+
+
+class _RangeTransferError(Exception):
+    """Range 能力已确认，但分块传输未能完整、安全地完成。"""
 
 
 def normalize_media_url(url: str) -> str:
@@ -67,6 +99,10 @@ def _display_media_url(url: str) -> str:
 
 def _dedupe_media_urls(urls: list[str]) -> list[str]:
     return list(dict.fromkeys(normalize_media_url(url) for url in urls if url))
+
+
+def _range_worker_count() -> int:
+    return min(max(1, FILE_RANGE_WORKERS), max(1, FILE_RANGE_MAX_WORKERS))
 
 
 def cleanup_medias(medias) -> None:
@@ -203,6 +239,7 @@ async def _probe_media_url(
     url: str,
     probe_bytes: int,
     probe_timeout: float,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[str, float] | None:
     header = BILIBILI_DESKTOP_HEADER.copy()
     header["Referer"] = referer
@@ -210,14 +247,23 @@ async def _probe_media_url(
     header["Accept-Encoding"] = "identity"
     downloaded = 0
     started = time.monotonic()
-    try:
+
+    async def probe() -> None:
+        nonlocal downloaded
         async with timeout(probe_timeout), client.stream("GET", url, headers=header) as response:
             if response.status_code not in (200, 206):
-                return None
+                return
             async for chunk in response.aiter_raw():
                 downloaded += len(chunk)
                 if downloaded >= probe_bytes:
                     break
+
+    try:
+        if semaphore:
+            async with semaphore:
+                await probe()
+        else:
+            await probe()
     except asyncio.TimeoutError:
         pass
     except httpx.HTTPError:
@@ -236,6 +282,7 @@ async def rank_media_urls(
     *,
     probe_bytes: int = UPOS_PROBE_BYTES,
     probe_timeout: float = UPOS_PROBE_TIMEOUT,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> list[str]:
     """并发小范围测速，成功候选按实际吞吐排序，探测失败候选保留在末尾供兜底。"""
     candidates = _dedupe_media_urls(urls)
@@ -243,7 +290,7 @@ async def rank_media_urls(
         return candidates
 
     results = await asyncio.gather(
-        *(_probe_media_url(client, referer, url, probe_bytes, probe_timeout) for url in candidates)
+        *(_probe_media_url(client, referer, url, probe_bytes, probe_timeout, semaphore) for url in candidates)
     )
     speeds = {result[0]: result[1] for result in results if result is not None}
     if not speeds:
@@ -255,6 +302,341 @@ async def rank_media_urls(
     summary = ", ".join(f"{_media_url_host(url)}={speeds[url] / (1024 * 1024):.1f} MiB/s" for url in speeds)
     logger.info(f"UPOS并发测速: {summary}; 选择 {_media_url_host(ranked[0])}")
     return ranked
+
+
+def _parse_content_range(value: str) -> tuple[int, int, int] | None:
+    match = _CONTENT_RANGE_RE.fullmatch(value.strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+async def _inspect_range_source(
+    client: httpx.AsyncClient,
+    referer: str,
+    url: str,
+    semaphore: asyncio.Semaphore | None = None,
+) -> _RangeSource | None:
+    header = BILIBILI_DESKTOP_HEADER.copy()
+    header["Referer"] = referer
+    header["Range"] = "bytes=0-0"
+    header["Accept-Encoding"] = "identity"
+
+    async def inspect() -> _RangeSource | None:
+        async with timeout(UPOS_PROBE_TIMEOUT), client.stream("GET", url, headers=header) as response:
+            if response.status_code != 206:
+                return None
+            parsed = _parse_content_range(response.headers.get("content-range", ""))
+            if not parsed or parsed[:2] != (0, 0) or parsed[2] <= 0:
+                return None
+            if response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
+                return None
+            if response.headers.get("content-length") not in (None, "1"):
+                return None
+            body = bytearray()
+            async for chunk in response.aiter_raw():
+                body.extend(chunk)
+                if len(body) > 1:
+                    return None
+            if len(body) != 1:
+                return None
+            return _RangeSource(
+                url=url,
+                total=parsed[2],
+                content_type=response.headers.get("content-type", "").split(";", 1)[0].lower(),
+                etag=response.headers.get("etag", ""),
+            )
+
+    try:
+        if semaphore:
+            async with semaphore:
+                return await inspect()
+        return await inspect()
+    except (asyncio.TimeoutError, httpx.HTTPError):
+        return None
+    except Exception as err:
+        logger.debug(f"Range能力探测失败: {_media_url_host(url)} ({type(err).__name__})")
+        return None
+
+
+async def _range_sources(
+    client: httpx.AsyncClient,
+    referer: str,
+    urls: list[str],
+    semaphore: asyncio.Semaphore | None = None,
+) -> list[_RangeSource]:
+    inspected = await asyncio.gather(*(_inspect_range_source(client, referer, url, semaphore) for url in urls))
+    return [source for source in inspected if source and source.strong_etag]
+
+
+def _build_range_chunks(total: int, workers: int) -> list[tuple[int, int, int]]:
+    max_chunks = max(1, FILE_RANGE_MAX_CHUNKS)
+    max_chunk_size = max(1, FILE_RANGE_MAX_CHUNK_SIZE)
+    if total > max_chunks * max_chunk_size:
+        return []
+    target_chunks = min(max_chunks, max(workers, workers * max(1, FILE_RANGE_CHUNKS_PER_WORKER)))
+    configured_chunk_size = min(max(1, FILE_RANGE_CHUNK_SIZE), max_chunk_size)
+    chunk_size = min(configured_chunk_size, max(1, math.ceil(total / target_chunks)))
+    chunk_size = max(chunk_size, math.ceil(total / max_chunks))
+    return [
+        (index, start, min(start + chunk_size - 1, total - 1))
+        for index, start in enumerate(range(0, total, chunk_size))
+    ]
+
+
+async def _fetch_range(
+    client: httpx.AsyncClient,
+    referer: str,
+    source: _RangeSource,
+    start: int,
+    end: int,
+) -> bytes:
+    header = BILIBILI_DESKTOP_HEADER.copy()
+    header["Referer"] = referer
+    header["Range"] = f"bytes={start}-{end}"
+    header["Accept-Encoding"] = "identity"
+    if source.strong_etag:
+        header["If-Range"] = source.strong_etag
+
+    try:
+        async with timeout(FILE_RANGE_REQUEST_TIMEOUT), client.stream("GET", source.url, headers=header) as response:
+            if response.status_code != 206:
+                raise _RangeTransferError(f"Range响应状态错误: {_media_url_host(source.url)} {response.status_code}")
+            parsed = _parse_content_range(response.headers.get("content-range", ""))
+            if parsed != (start, end, source.total):
+                raise _RangeTransferError(f"Content-Range不匹配: {_media_url_host(source.url)}")
+            if response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
+                raise _RangeTransferError(f"Range响应被压缩: {_media_url_host(source.url)}")
+            response_etag = response.headers.get("etag", "")
+            if source.strong_etag and response_etag and response_etag != source.strong_etag:
+                raise _RangeTransferError(f"Range资源版本变化: {_media_url_host(source.url)}")
+
+            expected = end - start + 1
+            content_length = response.headers.get("content-length")
+            if content_length is not None and int(content_length) != expected:
+                raise _RangeTransferError(f"Range长度头不匹配: {_media_url_host(source.url)}")
+            body = bytearray()
+            async for chunk in response.aiter_raw():
+                body.extend(chunk)
+                if len(body) > expected:
+                    raise _RangeTransferError(f"Range响应超长: {_media_url_host(source.url)}")
+            if len(body) != expected:
+                raise _RangeTransferError(f"Range响应截断: {_media_url_host(source.url)}")
+            return bytes(body)
+    except _RangeTransferError:
+        raise
+    except (asyncio.TimeoutError, httpx.HTTPError, ValueError) as err:
+        raise _RangeTransferError(f"Range请求失败: {_media_url_host(source.url)}") from err
+
+
+async def _download_range_chunk(
+    client: httpx.AsyncClient,
+    referer: str,
+    sources: list[_RangeSource],
+    semaphore: asyncio.Semaphore,
+    index: int,
+    start: int,
+    end: int,
+) -> bytes:
+    max_attempts = max(2, len(sources), FILE_RANGE_RETRIES + 1)
+    source_order = [sources[(index + attempt) % len(sources)] for attempt in range(max_attempts)]
+    active: dict[asyncio.Task, asyncio.Event] = {}
+    next_attempt = 0
+    last_error: Exception | None = None
+
+    async def launch(source: _RangeSource, started: asyncio.Event) -> bytes:
+        async with semaphore:
+            started.set()
+            return await _fetch_range(client, referer, source, start, end)
+
+    def start_attempt() -> None:
+        nonlocal next_attempt
+        event = asyncio.Event()
+        task = asyncio.create_task(launch(source_order[next_attempt], event))
+        active[task] = event
+        next_attempt += 1
+
+    start_attempt()
+    try:
+        while active:
+            if len(active) == 1:
+                only_event = next(iter(active.values()))
+                if not only_event.is_set():
+                    await only_event.wait()
+            hedge_timeout = (
+                FILE_RANGE_HEDGE_DELAY
+                if len(active) == 1 and next_attempt < max_attempts and FILE_RANGE_HEDGE_DELAY > 0
+                else None
+            )
+            done, pending = await asyncio.wait(
+                active.keys(),
+                timeout=hedge_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                start_attempt()
+                continue
+
+            active = {task: active[task] for task in pending}
+            failed = False
+            successful: bytes | None = None
+            for task in done:
+                try:
+                    result = task.result()
+                except Exception as err:
+                    last_error = err
+                    failed = True
+                else:
+                    successful = result
+
+            if successful is not None:
+                for pending_task in active:
+                    pending_task.cancel()
+                await asyncio.gather(*active.keys(), return_exceptions=True)
+                return successful
+
+            if failed and next_attempt < max_attempts and len(active) < 2:
+                start_attempt()
+        if last_error:
+            raise last_error
+        raise _RangeTransferError(f"Range分块下载失败: {start}-{end}")
+    finally:
+        for task in active:
+            task.cancel()
+        await asyncio.gather(*active.keys(), return_exceptions=True)
+
+
+async def _download_ranges_from_source(
+    client: httpx.AsyncClient,
+    referer: str,
+    source: _RangeSource,
+    filename: str,
+    semaphore: asyncio.Semaphore,
+    workers: int,
+) -> Path:
+    total = source.total
+    LOCAL_MEDIA_FILE_PATH.mkdir(parents=True, exist_ok=True)
+    media = LOCAL_MEDIA_FILE_PATH / filename
+    temp_media = LOCAL_MEDIA_FILE_PATH / uuid4().hex
+    chunks = _build_range_chunks(total, workers)
+    if not chunks:
+        raise _RangeTransferError(f"Range分块限制无法容纳文件: {filename}")
+    worker_count = min(workers, len(chunks))
+    write_lock = asyncio.Lock()
+    completed = 0
+    started = time.monotonic()
+    last_progress = started
+    tasks: list[asyncio.Task] = []
+    logger.info(
+        f"并发分块下载开始: {filename} {total / (1024 * 1024):.1f} MiB, "
+        f"{len(chunks)} 块/{worker_count} 连接, UPOS: {_media_url_host(source.url)}"
+    )
+
+    try:
+        with temp_media.open("w+b") as output:
+            output.truncate(total)
+
+            async def download_and_write(index: int, start: int, end: int) -> None:
+                nonlocal completed, last_progress
+                data = await _download_range_chunk(
+                    client,
+                    referer,
+                    [source],
+                    semaphore,
+                    index,
+                    start,
+                    end,
+                )
+                async with write_lock:
+                    output.seek(start)
+                    output.write(data)
+                    completed += len(data)
+                    now = time.monotonic()
+                    if DOWNLOAD_PROGRESS_INTERVAL > 0 and now - last_progress >= DOWNLOAD_PROGRESS_INTERVAL:
+                        speed = completed / max(now - started, 0.001) / (1024 * 1024)
+                        logger.info(
+                            f"分块下载进度: {filename} {completed / total:.1%} "
+                            f"({completed / (1024 * 1024):.1f}/{total / (1024 * 1024):.1f} MiB), "
+                            f"平均 {speed:.1f} MiB/s"
+                        )
+                        last_progress = now
+
+            chunk_queue = asyncio.Queue()
+            for chunk in chunks:
+                chunk_queue.put_nowait(chunk)
+
+            async def download_worker() -> None:
+                while True:
+                    try:
+                        chunk = chunk_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        await download_and_write(*chunk)
+                    finally:
+                        chunk_queue.task_done()
+
+            tasks = [asyncio.create_task(download_worker()) for _ in range(worker_count)]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            output.flush()
+
+        if completed != total or temp_media.stat().st_size != total:
+            raise _RangeTransferError(f"分块下载文件不完整: {filename}")
+        temp_media.replace(media)
+        elapsed = max(time.monotonic() - started, 0.001)
+        logger.info(
+            f"完成并发分块下载: {media} ({total / (1024 * 1024):.1f} MiB, "
+            f"平均 {total / elapsed / (1024 * 1024):.1f} MiB/s)"
+        )
+        return media
+    finally:
+        temp_media.unlink(missing_ok=True)
+
+
+async def get_media_by_ranges(
+    client: httpx.AsyncClient,
+    referer: str,
+    urls: list[str],
+    filename: str,
+    *,
+    range_semaphore: asyncio.Semaphore | None = None,
+) -> Path | None:
+    workers = _range_worker_count()
+    if workers <= 1 or FILE_RANGE_CHUNK_SIZE <= 0:
+        return None
+
+    semaphore = range_semaphore or asyncio.Semaphore(workers)
+    sources = await _range_sources(client, referer, urls, semaphore)
+    eligible = [
+        source
+        for source in sources
+        if max(1, FILE_RANGE_MIN_SIZE) <= source.total <= max(1, FILE_RANGE_MAX_SIZE)
+        and source.content_type.split("/", 1)[0] in ("video", "audio", "application")
+    ]
+    if not eligible:
+        return None
+
+    last_error: _RangeTransferError | None = None
+    for source in eligible:
+        try:
+            return await _download_ranges_from_source(
+                client,
+                referer,
+                source,
+                filename,
+                semaphore,
+                workers,
+            )
+        except _RangeTransferError as err:
+            last_error = err
+            logger.warning(f"分块源失败，尝试下一 UPOS: {_media_url_host(source.url)} ({err})")
+    if last_error:
+        raise last_error
+    return None
 
 
 async def get_media_from_candidates(
@@ -269,6 +651,8 @@ async def get_media_from_candidates(
     cache_lookup: CacheLookup | None = None,
     cache_key: str | None = None,
     raise_on_error: bool = False,
+    range_semaphore: asyncio.Semaphore | None = None,
+    parallel_ranges: bool = False,
 ) -> Path | str | list[Path] | None:
     """测速选择最快候选；完整下载失败时自动从下一个 UPOS 重新下载。"""
     if not no_cache and cache_lookup is not None:
@@ -276,7 +660,30 @@ async def get_media_from_candidates(
         if file_id:
             return file_id
 
-    ranked = await rank_media_urls(client, referer, urls)
+    if parallel_ranges and range_semaphore is None:
+        range_semaphore = asyncio.Semaphore(_range_worker_count())
+    ranked = await rank_media_urls(
+        client,
+        referer,
+        urls,
+        semaphore=range_semaphore if parallel_ranges else None,
+    )
+    if parallel_ranges:
+        try:
+            ranged = await get_media_by_ranges(
+                client,
+                referer,
+                ranked,
+                filename,
+                range_semaphore=range_semaphore,
+            )
+            if ranged:
+                return ranged
+        except asyncio.CancelledError:
+            raise
+        except _RangeTransferError as err:
+            logger.warning(f"并发分块下载失败，退回单流: {filename} ({err})")
+
     last_error: Exception | None = None
     for index, url in enumerate(ranked):
         try:
@@ -399,12 +806,14 @@ async def handle_dash_media(
     cache_lookup: CacheLookup | None = None,
     cache_key_builder: CacheKeyBuilder | None = None,
     document: bool = False,
+    range_semaphore: asyncio.Semaphore | None = None,
 ):
     """处理 DASH 视频合并（多轨流下载后用 ffmpeg 合并）"""
     if not f.media or not f.media.merge_streams:
         return []
     if len(f.media.urls) < 2:
         raise httpx.RequestError(f"DASH媒体轨道不足: {f.url}")
+    range_semaphore = range_semaphore or asyncio.Semaphore(_range_worker_count())
     res = []
     download_tasks: list[asyncio.Task] = []
     try:
@@ -436,6 +845,8 @@ async def handle_dash_media(
                     no_cache=True,
                     cache_lookup=cache_lookup,
                     raise_on_error=True,
+                    range_semaphore=range_semaphore,
+                    parallel_ranges=True,
                 )
             )
             for index, (media_url, filename) in enumerate(zip(f.media.urls, f.media.filenames, strict=False))
@@ -501,6 +912,7 @@ async def get_media_for_content(
             pool=FILE_POOL_TIMEOUT,
         ),
     ) as client:
+        range_semaphore = asyncio.Semaphore(_range_worker_count())
         mediathumb = None
         if f.media.thumbnail:
             if f.media.need_download or LOCAL_MODE:
@@ -532,6 +944,7 @@ async def get_media_for_content(
                     cache_lookup=cache_lookup,
                     cache_key_builder=cache_key_builder,
                     document=media_check_ignore,
+                    range_semaphore=range_semaphore,
                 )
             except httpx.HTTPError as err:
                 if not f.media.fallback_url:
@@ -549,6 +962,8 @@ async def get_media_for_content(
                     no_cache=True,
                     cache_lookup=cache_lookup,
                     raise_on_error=True,
+                    range_semaphore=range_semaphore,
+                    parallel_ranges=True,
                 )
                 if not fallback or isinstance(fallback, list):
                     raise httpx.RequestError(f"MP4 回退媒体下载失败: {f.url}") from err
@@ -577,6 +992,8 @@ async def get_media_for_content(
                         cache_key_builder(fn, f.media.type, media_url, media_check_ignore) if cache_key_builder else fn
                     ),
                     raise_on_error=required_media,
+                    range_semaphore=range_semaphore,
+                    parallel_ranges=f.media.type in ["video", "audio"],
                 )
                 for index, (media_url, fn) in enumerate(zip(f.media.urls, f.media.filenames, strict=False))
             ]

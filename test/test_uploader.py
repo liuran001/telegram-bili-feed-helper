@@ -58,6 +58,14 @@ def _make_jpeg(w: int, h: int) -> bytes:
     return buf.getvalue()
 
 
+class _AsyncBytesStream(httpx.AsyncByteStream):
+    def __init__(self, data: bytes):
+        self.data = data
+
+    async def __aiter__(self):
+        yield self.data
+
+
 def test_split_long_image_normal_returns_none():
     """正常比例图不切割，返回 None"""
     assert split_long_image_bytes(_make_jpeg(1080, 1080)) is None
@@ -104,14 +112,10 @@ async def test_required_media_download_propagates_httpx_timeout():
 
 
 async def test_upos_candidates_are_ranked_by_parallel_range_probe():
-    class ProbeStream(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            yield b"x" * 1024
-
     async def probe(request):
         assert request.headers["Range"] == "bytes=0-1023"
         await asyncio.sleep(0.005 if request.url.host == "fast.example" else 0.05)
-        return httpx.Response(206, stream=ProbeStream())
+        return httpx.Response(206, stream=_AsyncBytesStream(b"x" * 1024))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
         ranked = await rank_media_urls(
@@ -123,6 +127,44 @@ async def test_upos_candidates_are_ranked_by_parallel_range_probe():
         )
 
     assert ranked == ["https://fast.example/video.m4s", "https://slow.example/video.m4s"]
+
+
+async def test_shared_semaphore_caps_parallel_upos_probes():
+    active = 0
+    max_active = 0
+
+    async def probe(request):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            return httpx.Response(206, stream=_AsyncBytesStream(b"x" * 16))
+        finally:
+            active -= 1
+
+    semaphore = asyncio.Semaphore(2)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
+        await asyncio.gather(
+            rank_media_urls(
+                client,
+                "https://www.bilibili.com/video/BV1test",
+                ["https://v1.example/v.m4s", "https://v2.example/v.m4s"],
+                probe_bytes=16,
+                probe_timeout=1,
+                semaphore=semaphore,
+            ),
+            rank_media_urls(
+                client,
+                "https://www.bilibili.com/video/BV1test",
+                ["https://a1.example/a.m4s", "https://a2.example/a.m4s"],
+                probe_bytes=16,
+                probe_timeout=1,
+                semaphore=semaphore,
+            ),
+        )
+
+    assert max_active == 2
 
 
 async def test_upos_download_switches_to_next_candidate_after_failure(monkeypatch, tmp_path):
@@ -153,6 +195,346 @@ async def test_upos_download_switches_to_next_candidate_after_failure(monkeypatc
 
     assert result == expected
     assert attempts == [slow, fast]
+
+
+async def test_large_media_uses_parallel_range_chunks_and_cross_upos_retry(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    payload = b"0123456789abcdefghijklmnopqrstuvwxyz"
+    backup_payload = payload.upper()
+    urls = ["https://primary.example/video.m4s", "https://backup.example/video.m4s"]
+    active_chunks = 0
+    max_active_chunks = 0
+    requests = []
+
+    async def range_server(request):
+        nonlocal active_chunks, max_active_chunks
+        start, end = (int(value) for value in request.headers["Range"].removeprefix("bytes=").split("-"))
+        if (start, end) == (0, 0):
+            return httpx.Response(
+                206,
+                headers={
+                    "Content-Range": f"bytes 0-0/{len(payload)}",
+                    "Content-Type": "video/mp4",
+                    "ETag": '"same-resource"',
+                },
+                stream=_AsyncBytesStream(payload[:1]),
+            )
+
+        requests.append((request.url.host, start, end))
+        active_chunks += 1
+        max_active_chunks = max(max_active_chunks, active_chunks)
+        try:
+            await asyncio.sleep(0.01)
+            if request.url.host == "primary.example" and start == 0:
+                return httpx.Response(503, stream=_AsyncBytesStream(b""))
+            source_payload = backup_payload if request.url.host == "backup.example" else payload
+            data = source_payload[start : end + 1]
+            return httpx.Response(
+                206,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                    "Content-Type": "video/mp4",
+                },
+                stream=_AsyncBytesStream(data),
+            )
+        finally:
+            active_chunks -= 1
+
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    monkeypatch.setattr(download_module, "FILE_RANGE_WORKERS", 3)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNK_SIZE", 8)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MIN_SIZE", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_RETRIES", 2)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNKS_PER_WORKER", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_HEDGE_DELAY", 0.005)
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=urls))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(range_server)) as client:
+        result = await get_media_from_candidates(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            urls,
+            "video.m4s",
+            raise_on_error=True,
+            parallel_ranges=True,
+        )
+
+    assert isinstance(result, Path)
+    assert result.read_bytes() == backup_payload
+    assert max_active_chunks >= 2
+    assert ("primary.example", 0, 7) in requests
+    assert ("backup.example", 0, 7) in requests
+
+
+async def test_range_unsupported_falls_back_to_single_stream(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    urls = ["https://primary.example/video.m4s", "https://backup.example/video.m4s"]
+    expected = tmp_path / "video.m4s"
+    fallback = AsyncMock(return_value=expected)
+
+    async def no_range(request):
+        return httpx.Response(200, stream=_AsyncBytesStream(b"not-a-range-response"))
+
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    monkeypatch.setattr(download_module, "FILE_RANGE_WORKERS", 4)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MIN_SIZE", 1)
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=urls))
+    monkeypatch.setattr(download_module, "get_media", fallback)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(no_range)) as client:
+        result = await get_media_from_candidates(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            urls,
+            "video.m4s",
+            parallel_ranges=True,
+        )
+
+    assert result == expected
+    fallback.assert_awaited_once()
+
+
+@pytest.mark.parametrize("etag", ["", 'W/"weak"', 'w/"invalid"', "unquoted", '"one", "two"'])
+async def test_range_without_strong_etag_falls_back_to_single_stream(monkeypatch, tmp_path, etag):
+    from biliparser.uploader import download as download_module
+
+    url = "https://primary.example/video.m4s"
+    expected = tmp_path / "video.m4s"
+    fallback = AsyncMock(return_value=expected)
+
+    async def no_validator(request):
+        return httpx.Response(
+            206,
+            headers={"Content-Range": "bytes 0-0/64", "Content-Type": "video/mp4", "ETag": etag},
+            stream=_AsyncBytesStream(b"x"),
+        )
+
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    monkeypatch.setattr(download_module, "FILE_RANGE_WORKERS", 4)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MIN_SIZE", 1)
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=[url]))
+    monkeypatch.setattr(download_module, "get_media", fallback)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(no_validator)) as client:
+        result = await get_media_from_candidates(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            [url],
+            "video.m4s",
+            parallel_ranges=True,
+        )
+
+    assert result == expected
+    fallback.assert_awaited_once()
+
+
+async def test_range_advertised_size_over_limit_does_not_preallocate(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    url = "https://primary.example/video.m4s"
+    expected = tmp_path / "video.m4s"
+    fallback = AsyncMock(return_value=expected)
+
+    async def huge_resource(request):
+        total = 10_000
+        return httpx.Response(
+            206,
+            headers={
+                "Content-Range": f"bytes 0-0/{total}",
+                "Content-Type": "video/mp4",
+                "ETag": '"huge-resource"',
+            },
+            stream=_AsyncBytesStream(b"x"),
+        )
+
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    monkeypatch.setattr(download_module, "FILE_RANGE_WORKERS", 4)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MIN_SIZE", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MAX_SIZE", 9_999)
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=[url]))
+    monkeypatch.setattr(download_module, "get_media", fallback)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(huge_resource)) as client:
+        result = await get_media_from_candidates(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            [url],
+            "video.m4s",
+            parallel_ranges=True,
+        )
+
+    assert result == expected
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_range_local_io_error_is_not_masked_by_single_stream_fallback(monkeypatch):
+    from biliparser.uploader import download as download_module
+
+    url = "https://primary.example/video.m4s"
+    fallback = AsyncMock()
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=[url]))
+    monkeypatch.setattr(download_module, "get_media_by_ranges", AsyncMock(side_effect=OSError("disk full")))
+    monkeypatch.setattr(download_module, "get_media", fallback)
+
+    with pytest.raises(OSError, match="disk full"):
+        await get_media_from_candidates(
+            MagicMock(),
+            "https://www.bilibili.com/video/BV1test",
+            [url],
+            "video.m4s",
+            parallel_ranges=True,
+        )
+
+    fallback.assert_not_awaited()
+
+
+async def test_range_download_cancellation_removes_partial_file(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    urls = ["https://primary.example/video.m4s"]
+    chunk_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def range_server(request):
+        start, end = (int(value) for value in request.headers["Range"].removeprefix("bytes=").split("-"))
+        if (start, end) == (0, 0):
+            return httpx.Response(
+                206,
+                headers={
+                    "Content-Range": "bytes 0-0/64",
+                    "Content-Type": "video/mp4",
+                    "ETag": '"stable-resource"',
+                },
+                stream=_AsyncBytesStream(b"x"),
+            )
+        chunk_started.set()
+        await never.wait()
+
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    monkeypatch.setattr(download_module, "FILE_RANGE_WORKERS", 2)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNK_SIZE", 8)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MIN_SIZE", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNKS_PER_WORKER", 1)
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=urls))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(range_server)) as client:
+        running = asyncio.create_task(
+            get_media_from_candidates(
+                client,
+                "https://www.bilibili.com/video/BV1test",
+                urls,
+                "video.m4s",
+                raise_on_error=True,
+                parallel_ranges=True,
+            )
+        )
+        await asyncio.wait_for(chunk_started.wait(), timeout=1)
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+    assert running.cancelled()
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_tail_slow_chunk_is_hedged_on_spare_connection(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    payload = b"abcdefghijklmnopqrstuvwx"
+    urls = ["https://primary.example/video.m4s", "https://backup.example/video.m4s"]
+    requests = []
+    tail_primary_requests = 0
+
+    async def range_server(request):
+        nonlocal tail_primary_requests
+        start, end = (int(value) for value in request.headers["Range"].removeprefix("bytes=").split("-"))
+        if (start, end) == (0, 0):
+            return httpx.Response(
+                206,
+                headers={
+                    "Content-Range": f"bytes 0-0/{len(payload)}",
+                    "Content-Type": "video/mp4",
+                    "ETag": '"same-resource"',
+                },
+                stream=_AsyncBytesStream(payload[:1]),
+            )
+        requests.append((request.url.host, start, end))
+        if start == 16 and request.url.host == "primary.example":
+            tail_primary_requests += 1
+            await asyncio.sleep(0.1 if tail_primary_requests == 1 else 0.001)
+        else:
+            await asyncio.sleep(0.001)
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(payload)}"},
+            stream=_AsyncBytesStream(payload[start : end + 1]),
+        )
+
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    monkeypatch.setattr(download_module, "FILE_RANGE_WORKERS", 2)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNK_SIZE", 8)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MIN_SIZE", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_RETRIES", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNKS_PER_WORKER", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_HEDGE_DELAY", 0.005)
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=urls))
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(range_server)) as client:
+        result = await get_media_from_candidates(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            urls,
+            "video.m4s",
+            raise_on_error=True,
+            parallel_ranges=True,
+        )
+    elapsed = loop.time() - started
+
+    assert isinstance(result, Path)
+    assert result.read_bytes() == payload
+    assert requests.count(("primary.example", 16, 23)) >= 2
+    assert elapsed < 0.08
+
+
+def test_range_chunk_plan_oversegments_to_reduce_tail_slowdown(monkeypatch):
+    from biliparser.uploader import download as download_module
+
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNK_SIZE", 10_000)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNKS_PER_WORKER", 8)
+
+    chunks = download_module._build_range_chunks(total=10_000, workers=4)
+
+    assert len(chunks) >= 32
+    assert max(end - start + 1 for _, start, end in chunks) <= 313
+
+
+def test_range_chunk_plan_is_bounded_for_tiny_configured_chunks(monkeypatch):
+    from biliparser.uploader import download as download_module
+
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNK_SIZE", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNKS_PER_WORKER", 1_000_000)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MAX_CHUNKS", 128)
+
+    chunks = download_module._build_range_chunks(total=10_000, workers=4)
+
+    assert len(chunks) <= 128
+    assert chunks[0][1] == 0
+    assert chunks[-1][2] == 9_999
+
+
+def test_range_chunk_plan_rejects_conflicting_hard_limits(monkeypatch):
+    from biliparser.uploader import download as download_module
+
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNK_SIZE", 512 * 1024 * 1024)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MAX_CHUNK_SIZE", 64 * 1024 * 1024)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MAX_CHUNKS", 4)
+
+    chunks = download_module._build_range_chunks(total=2 * 1024 * 1024 * 1024, workers=4)
+
+    assert chunks == []
 
 
 async def test_dash_failure_uses_mp4_fallback(monkeypatch, tmp_path):
