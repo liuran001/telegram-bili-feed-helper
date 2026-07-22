@@ -1,21 +1,41 @@
-"""测试 channel/telegram/uploader.py — cleanup_medias、_get_constraints、split_long_image_bytes"""
+"""测试共享下载层与 Telegram 上传队列的合并行为。"""
 
+import asyncio
 import tempfile
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 from PIL import Image
 
 from biliparser.channel.telegram.uploader import (
+    _MEDIA_READ_TIMEOUT,
+    TelegramUploadQueueManager,
+    TelegramUploadTask,
     _cache_key,
-    _get_constraints,
     _send_kind,
     cache_media,
-    cleanup_medias,
     get_cached_media_file_id,
-    split_long_image_bytes,
 )
+from biliparser.model import Author, MediaConstraints, MediaInfo, ParsedContent
+from biliparser.provider import ProviderRegistry
+from biliparser.storage.models import TelegramFileCache
+from biliparser.uploader.download import cleanup_medias, get_media_for_content, split_long_image_bytes
+
+
+def _media_constraints() -> MediaConstraints:
+    return MediaConstraints(
+        max_upload_size=50 * 1024 * 1024,
+        max_download_size=2 * 1024 * 1024 * 1024,
+        caption_max_length=1024,
+    )
+
+
+def _manager(registry: ProviderRegistry | None = None) -> TelegramUploadQueueManager:
+    return TelegramUploadQueueManager(
+        registry=registry or ProviderRegistry(),
+        constraints=_media_constraints(),
+    )
 
 
 def _make_jpeg(w: int, h: int) -> bytes:
@@ -80,8 +100,10 @@ def test_cleanup_medias_empty():
     cleanup_medias([])
 
 
-def test_get_constraints_default():
-    mc = _get_constraints()
+def test_telegram_channel_constraints():
+    from biliparser.channel.telegram import TelegramChannel
+
+    mc = TelegramChannel().media_constraints
     assert mc.max_upload_size == 50 * 1024 * 1024  # 50MB (non-local mode)
     assert mc.max_download_size == 2 * 1024 * 1024 * 1024
     assert mc.caption_max_length == 1024
@@ -120,20 +142,19 @@ class _Att:
         self.file_id = fid
 
 
-@pytest.fixture
-async def _db():
-    from tortoise import Tortoise
-
-    await Tortoise.init(db_url="sqlite://:memory:", modules={"models": ["biliparser.storage.models"]})
-    await Tortoise.generate_schemas()
-    try:
-        yield
-    finally:
-        await Tortoise.close_connections()
-
-
-async def test_cache_does_not_cross_media_types(_db):
+async def test_cache_does_not_cross_media_types(monkeypatch):
     """回归：同一文件名先以 document 缓存，photo 读取必须 miss（否则 document file_id 会被塞进 InputMediaPhoto）"""
+    stored: dict[str, _Att] = {}
+
+    async def update_or_create(*, mediafilename, defaults):
+        stored[mediafilename] = _Att(defaults["file_id"])
+
+    async def get_or_none(*, mediafilename):
+        return stored.get(mediafilename)
+
+    monkeypatch.setattr(TelegramFileCache, "update_or_create", update_or_create)
+    monkeypatch.setattr(TelegramFileCache, "get_or_none", get_or_none)
+
     fn = "1211407624821538837_p1.jpg"
     await cache_media(fn, _Att("DOC_FILE_ID"), "document")
 
@@ -153,11 +174,6 @@ async def test_cache_does_not_cross_media_types(_db):
 
 async def test_media_group_caps_at_ten_single_group():
     """超过 10 张图（含切片后）只发一个 media group，caption 挂在第一项作说明，不额外发文字消息"""
-    from unittest.mock import AsyncMock, MagicMock
-
-    from biliparser.channel.telegram.uploader import UploadQueueManager
-    from biliparser.model import Author, MediaInfo, ParsedContent
-
     n = 15
     f = ParsedContent(
         url="https://t.bilibili.com/123",
@@ -174,7 +190,7 @@ async def test_media_group_caps_at_ten_single_group():
     message.reply_media_group = AsyncMock(side_effect=lambda media, **kw: tuple(MagicMock() for _ in media))
     message.reply_text = AsyncMock()
 
-    mgr = UploadQueueManager()
+    mgr = _manager()
     result = await mgr._upload_media_group(message, f, list(f.media.urls), None, "caption")
 
     # 只发一个 media group
@@ -190,68 +206,51 @@ async def test_media_group_caps_at_ten_single_group():
     # 返回结果与发送项数一致（供缓存对齐）
     assert len(result) == 10
     # media group 同样放宽 read_timeout（与单图/视频一致，避免大相册误超时重发整组）
-    from biliparser.channel.telegram.uploader import _MEDIA_READ_TIMEOUT
-
     assert message.reply_media_group.call_args.kwargs["read_timeout"] == _MEDIA_READ_TIMEOUT
 
 
 # ---- 上传重试保留显式画质（/video <画质>），避免重复发送不同清晰度 ----
 
 
-async def test_retry_parse_url_preserves_explicit_quality(monkeypatch):
+async def test_retry_parse_url_preserves_explicit_quality():
     """回归：首次上传超时重试时，重新解析必须透传原始 extra（如显式画质），
     否则会退回自动降档、发出与首次不同清晰度的第二份视频。"""
-    from unittest.mock import MagicMock
-
-    import biliparser.provider.bilibili as bili_pkg
-    from biliparser.channel.telegram.uploader import UploadQueueManager, UploadTask
-    from biliparser.model import Author, MediaInfo, ParsedContent
-
     f = ParsedContent(
         url="https://www.bilibili.com/video/av1?p=1",
         author=Author(name="tester"),
         media=MediaInfo(urls=["v", "a"], type="video", filenames=["x.mp4"]),
     )
-    task = UploadTask(
+    message = MagicMock()
+    task = TelegramUploadTask(
         user_id=1,
+        context=message,
         message=MagicMock(),
         parsed_content=f,
         media=[],
         mediathumb=None,
-        is_parse_cmd=False,
-        is_video_cmd=True,
         urls=["https://www.bilibili.com/video/av1?p=1"],
         extra={"quality": "dolby"},
     )
 
-    captured: dict = {}
-
-    class _FakeProvider:
-        async def parse(self, urls, constraints, extra=None):
-            captured["extra"] = extra
-            return [f]
-
-    monkeypatch.setattr(bili_pkg, "BilibiliProvider", _FakeProvider)
-
-    mgr = UploadQueueManager()
+    registry = MagicMock(spec=ProviderRegistry)
+    registry.parse = AsyncMock(return_value=[f])
+    mgr = _manager(registry)
     ok = await mgr._retry_parse_url(task)
 
     assert ok is True
-    # 关键断言：重试解析时把原始 extra 原样传给 provider.parse
-    assert captured["extra"] == {"quality": "dolby"}
+    registry.parse.assert_awaited_once_with(
+        [f.url],
+        mgr.constraints,
+        extra={"quality": "dolby"},
+    )
 
 
 # ---- 视频上传带封面 cover + 放宽 read_timeout（修复 HDR/杜比无封面 与 大视频误超时重发）----
 
 
-async def test_video_upload_passes_cover_and_read_timeout(_db):
+async def test_video_upload_passes_cover_and_read_timeout():
     """video 发送须同时传 thumbnail 与 cover（部分客户端只认 cover 才显示封面），
     并使用放宽的 read_timeout（大视频服务端处理慢，默认 60s 会误判超时触发重发）。"""
-    from unittest.mock import AsyncMock, MagicMock
-
-    from biliparser.channel.telegram.uploader import _MEDIA_READ_TIMEOUT, UploadQueueManager, UploadTask
-    from biliparser.model import Author, MediaInfo, ParsedContent
-
     f = ParsedContent(
         url="https://www.bilibili.com/video/av1?p=1",
         author=Author(name="tester"),
@@ -265,18 +264,17 @@ async def test_video_upload_passes_cover_and_read_timeout(_db):
     )
     message = MagicMock()
     message.reply_video = AsyncMock(return_value=MagicMock(effective_attachment=_Att("VID")))
-    task = UploadTask(
+    task = TelegramUploadTask(
         user_id=1,
+        context=message,
         message=message,
         parsed_content=f,
         media=["merged.mp4"],
         mediathumb="thumb.jpg",
-        is_parse_cmd=False,
-        is_video_cmd=True,
         urls=["https://www.bilibili.com/video/av1?p=1"],
     )
 
-    mgr = UploadQueueManager()
+    mgr = _manager()
     await mgr._upload_media(task)
 
     assert message.reply_video.call_count == 1
@@ -285,3 +283,125 @@ async def test_video_upload_passes_cover_and_read_timeout(_db):
     assert kwargs["cover"] == "thumb.jpg"
     assert kwargs["read_timeout"] == _MEDIA_READ_TIMEOUT
     assert _MEDIA_READ_TIMEOUT >= 600
+
+
+def test_telegram_upload_task_uses_context_message():
+    from telegram import Message
+
+    message = MagicMock(spec=Message)
+    task = TelegramUploadTask(
+        user_id=1,
+        context=message,
+        parsed_content=ParsedContent(url="https://example.com", author=Author()),
+        media=[],
+        mediathumb=None,
+        urls=["https://example.com"],
+    )
+
+    assert task.message is message
+
+
+async def test_telegram_upload_success_deletes_share_message(monkeypatch):
+    manager = _manager()
+    message = MagicMock()
+    task = TelegramUploadTask(
+        user_id=1,
+        context=message,
+        parsed_content=ParsedContent(url="https://example.com", author=Author()),
+        media=[],
+        mediathumb=None,
+        urls=["https://example.com"],
+    )
+    upload_media = AsyncMock(return_value=object())
+    delete_share_message = AsyncMock()
+    monkeypatch.setattr(manager, "_upload_media", upload_media)
+    monkeypatch.setattr(manager, "_try_delete_share_message", delete_share_message)
+
+    await manager._do_upload(task)
+
+    upload_media.assert_awaited_once_with(task)
+    delete_share_message.assert_awaited_once_with(task)
+
+
+async def test_stop_workers_cancels_active_upload(monkeypatch):
+    manager = _manager()
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+
+    async def process_upload(_task):
+        started.set()
+        await blocker.wait()
+
+    monkeypatch.setattr(manager, "_process_upload", process_upload)
+    task = TelegramUploadTask(
+        user_id=1,
+        context=MagicMock(),
+        parsed_content=ParsedContent(url="https://example.com/active", author=Author()),
+        media=[],
+        mediathumb=None,
+        urls=["https://example.com/active"],
+    )
+    await manager.submit(task)
+    await manager.start_workers()
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await asyncio.wait_for(manager.stop_workers(), timeout=1)
+
+    assert all(worker.done() for worker in manager.workers)
+
+
+async def test_cancel_user_tasks_counts_running_task_once():
+    manager = _manager()
+    running = asyncio.create_task(asyncio.Event().wait())
+    task = TelegramUploadTask(
+        user_id=1,
+        context=MagicMock(),
+        parsed_content=ParsedContent(url="https://example.com/running", author=Author()),
+        media=[],
+        mediathumb=None,
+        urls=["https://example.com/running"],
+    )
+    manager.active_tasks[1] = {task.task_id: task}
+    manager.processing_tasks[1] = {task.task_id: running}
+
+    assert await manager.cancel_user_tasks(1) == 1
+    assert 1 not in manager.active_tasks
+    assert 1 not in manager.processing_tasks
+    await asyncio.gather(running, return_exceptions=True)
+
+
+async def test_empty_video_urls_fall_back_to_caption(monkeypatch):
+    from biliparser.uploader import queue as queue_module
+
+    content = ParsedContent(
+        url="https://example.com/empty-video",
+        author=Author(name="tester"),
+        media=MediaInfo(urls=[], type="video", filenames=[]),
+    )
+    assert await get_media_for_content(content) == ([], None)
+
+    class Lock:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    cache = MagicMock()
+    cache.lock.return_value = Lock()
+    monkeypatch.setattr(queue_module, "RedisCache", lambda: cache)
+
+    message = MagicMock()
+    message.reply_text = AsyncMock()
+    task = TelegramUploadTask(
+        user_id=1,
+        context=message,
+        message=message,
+        parsed_content=content,
+        media=[],
+        mediathumb=None,
+        urls=[content.url],
+    )
+
+    assert await _manager()._try_upload_once(task, attempt=1, max_retries=1) is True
+    message.reply_text.assert_awaited_once()

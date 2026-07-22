@@ -1,8 +1,12 @@
+import asyncio
+import contextlib
+import io
 import os
 import re
 import sys
 from uuid import uuid4
 
+from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -38,11 +42,14 @@ from telegram.ext import (
     filters,
 )
 
-from ...model import Comment, MediaConstraints, ParsedContent
 from ...provider import ProviderRegistry
+from ...provider.bilibili.api import referer_url
+from ...provider.bilibili.credential import credentialFactory
 from ...storage import db_close, db_context, db_init
 from ...storage.cache import RedisCache
 from ...utils import escape_markdown, logger
+from .formatting import format_caption_for_telegram
+from .uploader import TelegramUploadQueueManager, TelegramUploadTask, _send_kind, get_cached_media_file_id
 
 BILIBILI_URL_REGEX = (
     r"(?i)(?:https?://)?[\w\.]*?(?:bilibili(?:bb)?\.com|(?:b23(?:bb)?|acg)\.tv|bili2?2?3?3?\.cn)\S+|BV\w{10}"
@@ -61,73 +68,127 @@ SOURCE_CODE_MARKUP = InlineKeyboardMarkup(
 )
 
 
-def _clean_cn_tag_style(content: str) -> str:
-    """Refine cn tag style display: #abc# -> #abc"""
-    if not content:
-        return ""
-    return re.sub(r"\\#((?:(?!\\#).)+)\\#", r"\\#\1 ", content)
+def _get_env_int(name: str, default: int = 0) -> int:
+    raw_value = os.environ.get(name, str(default))
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        logger.warning(f"{name} 配置无效: {raw_value}")
+        return default
 
 
-def _make_user_markdown(name: str, uid: str) -> str:
-    if name and uid:
-        return f"[@{escape_markdown(name)}](https://space.bilibili.com/{uid})"
-    return ""
+def _get_request_limit_config() -> tuple[int, int]:
+    return _get_env_int("REQUEST_LIMIT_COUNT"), _get_env_int("REQUEST_LIMIT_TTL")
 
 
-def _format_comment_markdown(comments: list[Comment]) -> str:
-    result = ""
-    for c in comments:
-        user_md = _make_user_markdown(c.author.name, c.author.uid)
-        if c.is_target:
-            result += f"💬\\> {user_md}:\n{escape_markdown(c.text)}\n"
-        elif c.is_top:
-            result += f"🔝\\> {user_md}:\n{escape_markdown(c.text)}\n"
-    return result
+def _get_admin_user_id() -> int | None:
+    """Read the single Telegram user ID allowed to use administrative commands."""
+    raw = os.environ.get("ADMIN_USER_ID", "")
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        logger.warning(f"管理员用户 ID 配置无效: {raw!r}")
+        return None
 
 
-def _try_append_within_limit(components: list[str], text: str, max_len: int) -> bool:
-    if not text:
+def _is_admin(update: Update) -> bool:
+    user = update.effective_user
+    admin_user_id = _get_admin_user_id()
+    return user is not None and admin_user_id is not None and user.id == admin_user_id
+
+
+async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a Bilibili QR code to the configured administrator and wait for login."""
+    message = update.effective_message
+    if message is None:
+        return
+
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    if not _is_admin(update):
+        if _get_admin_user_id() is None and update.effective_user is not None:
+            await message.reply_text(
+                f"你的 Telegram 用户 ID 是：{update.effective_user.id}\n"
+                "请将此 ID 配置到环境变量 ADMIN_USER_ID 后重启 Bot。"
+            )
+        return
+
+    old_task: asyncio.Task | None = context.bot_data.get("bilibili_login_task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    qr_login = QrCodeLogin()
+    try:
+        await qr_login.generate_qrcode()
+        picture = qr_login.get_qrcode_picture()
+        image = io.BytesIO(picture.content)
+        image.name = "bilibili-login.png"
+        await message.reply_photo(photo=image, caption="请使用哔哩哔哩客户端扫描二维码登录（二维码有效期约 3 分钟）。")
+    except Exception:
+        logger.exception("生成 Bilibili 登录二维码失败")
+        await message.reply_text("生成登录二维码失败，请稍后重试")
+        return
+
+    async def wait_for_login() -> None:
+        try:
+            while True:
+                await asyncio.sleep(3)
+                state = await qr_login.check_state()
+                if state is QrCodeLoginEvents.DONE:
+                    await credentialFactory.set(qr_login.get_credential())
+                    await message.reply_text("Bilibili 扫码登录成功，凭证已更新。")
+                    return
+                if state is QrCodeLoginEvents.TIMEOUT:
+                    await message.reply_text("登录二维码已过期，请重新发送 /login。")
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("轮询 Bilibili 扫码登录状态失败")
+            await message.reply_text("扫码登录失败，请重新发送 /login。")
+
+    context.bot_data["bilibili_login_task"] = context.application.create_task(wait_for_login())
+
+
+def _format_rate_limit_ttl(ttl_seconds: int) -> str:
+    if ttl_seconds <= 0:
+        return "稍后"
+    hours, remainder = divmod(ttl_seconds, 3600)
+    minutes = remainder // 60
+    if hours:
+        return f"{hours} 小时 {minutes} 分钟后"
+    if minutes:
+        return f"{minutes} 分钟后"
+    return f"{ttl_seconds} 秒后"
+
+
+async def check_request_limit(user_id: int | str) -> tuple[bool, int, int]:
+    limit_count, limit_ttl = _get_request_limit_config()
+    if limit_count <= 0 or limit_ttl <= 0:
+        return True, 0, 0
+
+    cache = RedisCache()
+    key = f"request_limit:{limit_ttl}:{user_id}"
+    count = await cache.incr(key)
+    ttl = await cache.ttl(key)
+    if count == 1 or ttl < 0:
+        await cache.expire(key, limit_ttl)
+        ttl = limit_ttl
+
+    remaining = max(0, limit_count - count)
+    return count <= limit_count, remaining, max(0, ttl)
+
+
+async def check_message_request_limit(message: Message, reply_on_limit: bool = True) -> bool:
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    allowed, _remaining, ttl = await check_request_limit(user_id)
+    if allowed:
         return True
-    test_content = "".join([*components, text])
-    if len(test_content) < max_len:
-        components.append(text)
-        return True
+    if reply_on_limit:
+        await message.reply_text(f"请求次数已达到上限，请 {_format_rate_limit_ttl(ttl)} 再试")
+    logger.info(f"请求被限流: 用户 {user_id}")
     return False
-
-
-def format_caption_for_telegram(content: ParsedContent, constraints: MediaConstraints) -> str:
-    """Format ParsedContent into a Telegram MarkdownV2 caption string.
-
-    Mirrors the original Feed.caption logic:
-    - First line: extra_markdown or escaped url
-    - User markdown link
-    - Content and comments wrapped in **>...|| (spoiler blockquote)
-    """
-    max_len = constraints.caption_max_length
-
-    components = [f"{content.extra_markdown or escape_markdown(content.url)}\n"]
-
-    if content.author.name:
-        user_md = _make_user_markdown(content.author.name, content.author.uid)
-        if not _try_append_within_limit(components, f"{user_md}:", max_len):
-            return "".join(components)
-
-    # Content markdown
-    content_md = content.content_markdown or escape_markdown(content.content)
-    if content_md and not content_md.endswith("\n"):
-        content_md += "\n"
-
-    # Comment markdown
-    comment_md = _format_comment_markdown(content.comments)
-
-    # Wrap content and comments in **>...|| (spoiler blockquote for folding)
-    for text in [content_md, comment_md]:
-        if text:
-            formatted = f"\n**>{_clean_cn_tag_style(text).replace(chr(10), chr(10) + '>')}||"
-            if not _try_append_within_limit(components, formatted, max_len):
-                return "".join(components)
-
-    return "".join(components)
 
 
 async def get_description(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -189,8 +250,6 @@ async def message_to_urls(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def parse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Bilibili URL parse requests."""
-    from .uploader import UploadQueueManager, UploadTask
-
     message, urls = await message_to_urls(update, context)
     if message is None:
         return
@@ -209,10 +268,11 @@ async def parse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if is_parse or is_video or message.chat.type == ChatType.PRIVATE:
             await message.reply_text("链接不正确")
         return
+    should_reply_on_limit = is_parse or is_video or message.chat.type == ChatType.PRIVATE
+    if not await check_message_request_limit(message, reply_on_limit=should_reply_on_limit):
+        return
 
     logger.info(f"Parse: {urls} (用户: {message.from_user.id if message.from_user else 'unknown'})")
-
-    import contextlib
 
     with contextlib.suppress(Exception):
         await message.reply_chat_action(ChatAction.TYPING)
@@ -236,32 +296,31 @@ async def parse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         user_id = message.from_user.id if message.from_user else message.chat.id
-        task = UploadTask(
+        task = TelegramUploadTask(
             user_id=user_id,
+            context=message,
             message=message,
             parsed_content=f,
             media=[],
             mediathumb=None,
-            is_parse_cmd=is_parse,
-            is_video_cmd=is_video,
             urls=urls,
             extra=extra,
         )
 
-        upload_queue_manager: UploadQueueManager = context.bot_data["upload_queue_manager"]
+        upload_queue_manager: TelegramUploadQueueManager = context.bot_data["upload_queue_manager"]
         await upload_queue_manager.submit(task)
         logger.info(f"已提交上传任务: {f.url} (用户: {user_id})")
 
 
 async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /file and /cover commands."""
-    from .uploader import UploadQueueManager, UploadTask
-
     message, urls = await message_to_urls(update, context)
     if message is None or not message.text:
         return
     if not urls:
         await message.reply_text("链接不正确")
+        return
+    if not await check_message_request_limit(message):
         return
 
     fetch_mode = "cover" if message.text.startswith("/cover") else "file"
@@ -283,28 +342,25 @@ async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         user_id = message.from_user.id if message.from_user else message.chat.id
-        task = UploadTask(
+        task = TelegramUploadTask(
             user_id=user_id,
+            context=message,
             message=message,
             parsed_content=f,
             media=[],
             mediathumb=None,
-            is_parse_cmd=False,
-            is_video_cmd=False,
             urls=urls,
             task_type="fetch",
             fetch_mode=fetch_mode,
         )
 
-        upload_queue_manager: UploadQueueManager = context.bot_data["upload_queue_manager"]
+        upload_queue_manager: TelegramUploadQueueManager = context.bot_data["upload_queue_manager"]
         await upload_queue_manager.submit(task)
         logger.info(f"已提交 fetch 任务: {f.url} (用户: {user_id}, 模式: {fetch_mode})")
 
 
 async def inlineparse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline queries."""
-    from ...provider.bilibili.api import referer_url
-    from .uploader import _send_kind, get_cached_media_file_id
 
     async def inline_query_answer(inline_query: InlineQuery, msg):
         try:
@@ -422,8 +478,6 @@ async def inlineparse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
             ]
         else:
-            import asyncio
-
             cache_file_ids = (
                 await asyncio.gather(
                     *[
@@ -503,14 +557,12 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel all queued tasks for the user."""
-    from .uploader import UploadQueueManager  # noqa: TC001
-
     message = update.effective_message
     if message is None:
         return
 
     user_id = message.from_user.id if message.from_user else message.chat.id
-    upload_queue_manager: UploadQueueManager = context.bot_data["upload_queue_manager"]
+    upload_queue_manager: TelegramUploadQueueManager = context.bot_data["upload_queue_manager"]
     cancelled_count = await upload_queue_manager.cancel_user_tasks(user_id)
 
     if cancelled_count > 0:
@@ -522,14 +574,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current tasks for the user."""
-    from .uploader import UploadQueueManager  # noqa: TC001
-
     message = update.effective_message
     if message is None:
         return
 
     user_id = message.from_user.id if message.from_user else message.chat.id
-    upload_queue_manager: UploadQueueManager = context.bot_data["upload_queue_manager"]
+    upload_queue_manager: TelegramUploadQueueManager = context.bot_data["upload_queue_manager"]
     user_tasks = await upload_queue_manager.get_user_tasks(user_id)
 
     if user_tasks:
@@ -560,6 +610,7 @@ def add_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("clear", clear, block=False))
     application.add_handler(CommandHandler("video", parse, block=False))
     application.add_handler(CommandHandler("parse", parse, block=False))
+    application.add_handler(CommandHandler("login", login, block=False))
     application.add_handler(
         MessageHandler(
             filters.Entity(MessageEntity.URL)
@@ -574,27 +625,30 @@ def add_handlers(application: Application) -> None:
     application.add_error_handler(error_handler)
 
 
-def run_bot(channel, provider_registry: ProviderRegistry) -> None:
-    """Build and run the Telegram bot application."""
-    from .uploader import UploadQueueManager
-
+def _get_token() -> str:
     if os.environ.get("TOKEN"):
-        token = os.environ["TOKEN"]
-    elif len(sys.argv) >= 2:
-        token = sys.argv[1]
-    else:
-        logger.error("Need TOKEN.")
-        sys.exit(1)
+        return os.environ["TOKEN"]
+    if len(sys.argv) >= 2:
+        return sys.argv[1]
+    logger.error("Need TOKEN.")
+    sys.exit(1)
 
+
+def build_application(channel, provider_registry: ProviderRegistry, manage_db: bool = True) -> Application:
+    """Build the Telegram bot application."""
+    token = _get_token()
     local_mode = bool(os.environ.get("LOCAL_MODE", False))
 
     async def post_init(application: Application) -> None:
-        await db_init()
+        if manage_db:
+            await db_init()
 
         max_workers = int(os.environ.get("UPLOAD_WORKERS", 4))
         max_user_tasks = int(os.environ.get("MAX_USER_TASKS", 5))
         max_queue_size = int(os.environ.get("MAX_QUEUE_SIZE", 200))
-        upload_queue_manager = UploadQueueManager(
+        upload_queue_manager = TelegramUploadQueueManager(
+            registry=provider_registry,
+            constraints=channel.media_constraints,
             max_workers=max_workers,
             max_user_tasks=max_user_tasks,
             max_queue_size=max_queue_size,
@@ -619,19 +673,27 @@ def run_bot(channel, provider_registry: ProviderRegistry) -> None:
                 ["clear", "清除匹配内容缓存"],
                 ["tasks", "查看当前任务"],
                 ["cancel", "取消正在排队的任务"],
+                ["login", "管理员扫码更新 Bilibili 登录凭证"],
             ]
         )
         bot_me = await application.bot.get_me()
         logger.info(f"Bot @{bot_me.username} started.")
 
     async def post_shutdown(application: Application) -> None:
-        upload_queue_manager: UploadQueueManager | None = application.bot_data.get("upload_queue_manager")
+        login_task: asyncio.Task | None = application.bot_data.get("bilibili_login_task")
+        if login_task and not login_task.done():
+            login_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await login_task
+
+        upload_queue_manager: TelegramUploadQueueManager | None = application.bot_data.get("upload_queue_manager")
         if upload_queue_manager:
             await upload_queue_manager.stop_workers()
             logger.info("上传队列管理器已停止")
 
         await channel.stop()
-        await db_close()
+        if manage_db:
+            await db_close()
 
     application = (
         Application.builder()
@@ -661,6 +723,46 @@ def run_bot(channel, provider_registry: ProviderRegistry) -> None:
     )
 
     add_handlers(application)
+    return application
+
+
+async def run_bot_async(channel, provider_registry: ProviderRegistry) -> None:
+    """Run the Telegram bot inside an existing asyncio loop."""
+    token = _get_token()
+    application = build_application(channel, provider_registry, manage_db=False)
+
+    await application.initialize()
+    try:
+        if application.post_init:
+            await application.post_init(application)
+
+        if os.environ.get("DOMAIN"):
+            await application.updater.start_webhook(
+                listen=os.environ.get("HOST", "0.0.0.0"),  # noqa: S104
+                port=int(os.environ.get("PORT", 9000)),
+                url_path=token,
+                webhook_url=f"{os.environ.get('DOMAIN')}{token}",
+                max_connections=100,
+            )
+        else:
+            await application.updater.start_polling()
+
+        await application.start()
+        await asyncio.Event().wait()
+    finally:
+        if application.updater.running:
+            await application.updater.stop()
+        if application.running:
+            await application.stop()
+        await application.shutdown()
+        if application.post_shutdown:
+            await application.post_shutdown(application)
+
+
+def run_bot(channel, provider_registry: ProviderRegistry) -> None:
+    """Build and run the Telegram bot application."""
+    token = _get_token()
+    application = build_application(channel, provider_registry, manage_db=True)
 
     with db_context():
         if os.environ.get("DOMAIN"):
