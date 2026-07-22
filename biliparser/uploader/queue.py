@@ -153,14 +153,13 @@ class UploadQueueManager(ABC):
                         self.processing_tasks[task.user_id] = {}
                     self.processing_tasks[task.user_id][task.task_id] = process_task
                 try:
-                    await process_task
+                    # shield 让 worker 自身被取消与 process_task 主动取消可可靠区分，
+                    # 同时兼容没有 Task.cancelling() 的 Python 3.10。
+                    await asyncio.shield(process_task)
                 except asyncio.CancelledError:
-                    # worker 自身被 stop_workers() 取消时，取消会传播到正在等待的
-                    # process_task。此时必须继续向外传播，否则 worker 会重新进入
-                    # queue.get()，导致 stop_workers() 永久等待。
-                    if asyncio.current_task().cancelling():
-                        raise
                     if not process_task.cancelled():
+                        process_task.cancel()
+                        await asyncio.gather(process_task, return_exceptions=True)
                         raise
                 finally:
                     async with self._lock:
