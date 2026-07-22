@@ -267,6 +267,63 @@ async def test_large_media_uses_parallel_range_chunks_and_cross_upos_retry(monke
     assert ("backup.example", 0, 7) in requests
 
 
+async def test_range_download_adaptively_reduces_concurrency(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    payload = b"0123456789abcdefghijklmnopqrstuvwxyz"
+    url = "https://primary.example/video.m4s"
+
+    async def range_server(request):
+        start, end = (int(value) for value in request.headers["Range"].removeprefix("bytes=").split("-"))
+        if (start, end) == (0, 0):
+            return httpx.Response(
+                206,
+                headers={
+                    "Content-Range": f"bytes 0-0/{len(payload)}",
+                    "Content-Type": "video/mp4",
+                    "ETag": '"stable-resource"',
+                },
+                stream=_AsyncBytesStream(payload[:1]),
+            )
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(payload)}"},
+            stream=_AsyncBytesStream(payload[start : end + 1]),
+        )
+
+    original_download = download_module._download_ranges_from_source
+    worker_levels = []
+
+    async def fail_high_concurrency(client, referer, source, filename, semaphore, workers):
+        worker_levels.append(workers)
+        if workers > 1:
+            raise download_module._RangeTransferError("simulated CDN concurrency limit")
+        return await original_download(client, referer, source, filename, semaphore, workers)
+
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    monkeypatch.setattr(download_module, "FILE_RANGE_WORKERS", 4)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNK_SIZE", 8)
+    monkeypatch.setattr(download_module, "FILE_RANGE_MIN_SIZE", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_CHUNKS_PER_WORKER", 1)
+    monkeypatch.setattr(download_module, "FILE_RANGE_HEDGE_DELAY", 0)
+    monkeypatch.setattr(download_module, "rank_media_urls", AsyncMock(return_value=[url]))
+    monkeypatch.setattr(download_module, "_download_ranges_from_source", fail_high_concurrency)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(range_server)) as client:
+        result = await get_media_from_candidates(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            [url],
+            "video.m4s",
+            raise_on_error=True,
+            parallel_ranges=True,
+        )
+
+    assert isinstance(result, Path)
+    assert result.read_bytes() == payload
+    assert worker_levels == [4, 2, 1]
+
+
 async def test_range_unsupported_falls_back_to_single_stream(monkeypatch, tmp_path):
     from biliparser.uploader import download as download_module
 
@@ -716,6 +773,7 @@ async def test_media_client_receives_configured_timeout(monkeypatch):
     await get_media_for_content(content)
 
     assert captured["timeout"].read == FILE_READ_TIMEOUT
+    assert captured["http2"] is False
 
 
 async def test_fetch_image_download_failure_propagates_for_queue_retry(monkeypatch):

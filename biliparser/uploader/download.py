@@ -424,14 +424,17 @@ async def _fetch_range(
     except _RangeTransferError:
         raise
     except (asyncio.TimeoutError, httpx.HTTPError, ValueError) as err:
-        raise _RangeTransferError(f"Range请求失败: {_media_url_host(source.url)}") from err
+        raise _RangeTransferError(
+            f"Range请求失败: {_media_url_host(source.url)} ({type(err).__name__}: {err})"
+        ) from err
 
 
 async def _download_range_chunk(
     client: httpx.AsyncClient,
     referer: str,
     sources: list[_RangeSource],
-    semaphore: asyncio.Semaphore,
+    global_semaphore: asyncio.Semaphore,
+    source_semaphore: asyncio.Semaphore,
     index: int,
     start: int,
     end: int,
@@ -443,7 +446,7 @@ async def _download_range_chunk(
     last_error: Exception | None = None
 
     async def launch(source: _RangeSource, started: asyncio.Event) -> bytes:
-        async with semaphore:
+        async with source_semaphore, global_semaphore:
             started.set()
             return await _fetch_range(client, referer, source, start, end)
 
@@ -520,6 +523,7 @@ async def _download_ranges_from_source(
     if not chunks:
         raise _RangeTransferError(f"Range分块限制无法容纳文件: {filename}")
     worker_count = min(workers, len(chunks))
+    source_semaphore = asyncio.Semaphore(worker_count)
     write_lock = asyncio.Lock()
     completed = 0
     started = time.monotonic()
@@ -541,6 +545,7 @@ async def _download_ranges_from_source(
                     referer,
                     [source],
                     semaphore,
+                    source_semaphore,
                     index,
                     start,
                     end,
@@ -621,19 +626,27 @@ async def get_media_by_ranges(
         return None
 
     last_error: _RangeTransferError | None = None
+    worker_levels = list(dict.fromkeys((workers, max(1, workers // 2), 1)))
     for source in eligible:
-        try:
-            return await _download_ranges_from_source(
-                client,
-                referer,
-                source,
-                filename,
-                semaphore,
-                workers,
-            )
-        except _RangeTransferError as err:
-            last_error = err
-            logger.warning(f"分块源失败，尝试下一 UPOS: {_media_url_host(source.url)} ({err})")
+        for index, attempt_workers in enumerate(worker_levels):
+            try:
+                return await _download_ranges_from_source(
+                    client,
+                    referer,
+                    source,
+                    filename,
+                    semaphore,
+                    attempt_workers,
+                )
+            except _RangeTransferError as err:
+                last_error = err
+                if index + 1 < len(worker_levels):
+                    logger.warning(
+                        f"分块下载失败，降低并发到 {worker_levels[index + 1]} 后重试: "
+                        f"{_media_url_host(source.url)} ({err})"
+                    )
+                else:
+                    logger.warning(f"分块源失败，尝试下一 UPOS: {_media_url_host(source.url)} ({err})")
     if last_error:
         raise last_error
     return None
@@ -902,7 +915,9 @@ async def get_media_for_content(
         return [], None
 
     async with httpx.AsyncClient(
-        http2=True,
+        # 大文件 Range 并发需要独立 HTTP/1.1 连接；HTTP/2 会把多个块复用到
+        # 同一 TCP 连接，部分 Akamai UPOS 一次 stream reset 就会让所有块同时失败。
+        http2=False,
         follow_redirects=True,
         proxy=os.environ.get("FILE_PROXY", os.environ.get("HTTP_PROXY")),
         timeout=httpx.Timeout(
