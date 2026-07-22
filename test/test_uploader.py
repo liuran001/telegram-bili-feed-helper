@@ -6,6 +6,8 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+import pytest
 from PIL import Image
 
 from biliparser.channel.telegram.uploader import (
@@ -20,7 +22,14 @@ from biliparser.channel.telegram.uploader import (
 from biliparser.model import Author, MediaConstraints, MediaInfo, ParsedContent
 from biliparser.provider import ProviderRegistry
 from biliparser.storage.models import TelegramFileCache
-from biliparser.uploader.download import cleanup_medias, get_media_for_content, split_long_image_bytes
+from biliparser.uploader.download import (
+    FILE_READ_TIMEOUT,
+    cleanup_medias,
+    get_media,
+    get_media_for_content,
+    normalize_media_url,
+    split_long_image_bytes,
+)
 
 
 def _media_constraints() -> MediaConstraints:
@@ -65,6 +74,126 @@ def test_split_long_image_respects_max_pieces():
     """极端超长图切割片数不超过 max_pieces"""
     pieces = split_long_image_bytes(_make_jpeg(1080, 25967), ratio=2, max_pieces=10)
     assert pieces is not None and len(pieces) <= 10
+
+
+def test_bilibili_cdn_http_url_is_upgraded_to_https():
+    assert normalize_media_url("http://i2.hdslb.com/bfs/archive/cover.jpg") == (
+        "https://i2.hdslb.com/bfs/archive/cover.jpg"
+    )
+    assert normalize_media_url("http://example.com/file.jpg") == "http://example.com/file.jpg"
+
+
+async def test_required_media_download_propagates_httpx_timeout():
+    async def raise_timeout(request):
+        raise httpx.ReadTimeout("slow CDN", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(raise_timeout)) as client:
+        with pytest.raises(httpx.ReadTimeout):
+            await get_media(
+                client,
+                "https://www.bilibili.com/video/BV1test",
+                "https://cdn.example.com/video.m4s",
+                "video.m4s",
+                raise_on_error=True,
+            )
+
+
+async def test_dash_failure_uses_mp4_fallback(monkeypatch, tmp_path):
+    from biliparser.uploader import download as download_module
+
+    content = ParsedContent(
+        url="https://www.bilibili.com/video/BV1test",
+        author=Author(name="tester"),
+        media=MediaInfo(
+            urls=["https://cdn.example.com/video.m4s", "https://cdn.example.com/audio.m4s"],
+            type="video",
+            filenames=["video.m4s", "audio.m4s"],
+            need_download=True,
+            merge_streams=True,
+            fallback_url="https://cdn.example.com/fallback.mp4",
+        ),
+    )
+    fallback_path = tmp_path / "video_merged.mp4"
+
+    async def fail_dash(*args, **kwargs):
+        raise httpx.ReadTimeout("slow DASH")
+
+    async def download_fallback(client, referer, url, filename, **kwargs):
+        assert url == content.media.fallback_url
+        assert filename == "video_merged.mp4"
+        assert kwargs["raise_on_error"] is True
+        return fallback_path
+
+    monkeypatch.setattr(download_module, "handle_dash_media", fail_dash)
+    monkeypatch.setattr(download_module, "get_media", download_fallback)
+
+    media, thumbnail = await get_media_for_content(content)
+
+    assert media == [fallback_path]
+    assert thumbnail is None
+    assert content.media.urls == [content.media.fallback_url]
+    assert content.media.filenames == ["video_merged.mp4"]
+    assert content.media.merge_streams is False
+
+
+async def test_dash_failure_without_fallback_propagates(monkeypatch):
+    from biliparser.uploader import download as download_module
+
+    content = ParsedContent(
+        url="https://www.bilibili.com/video/BV1test",
+        author=Author(name="tester"),
+        media=MediaInfo(
+            urls=["https://cdn.example.com/video.m4s", "https://cdn.example.com/audio.m4s"],
+            type="video",
+            filenames=["video.m4s", "audio.m4s"],
+            need_download=True,
+            merge_streams=True,
+        ),
+    )
+
+    async def fail_dash(*args, **kwargs):
+        raise httpx.ReadTimeout("slow DASH")
+
+    monkeypatch.setattr(download_module, "handle_dash_media", fail_dash)
+
+    with pytest.raises(httpx.ReadTimeout):
+        await get_media_for_content(content)
+
+
+def test_file_read_timeout_is_not_httpx_five_second_default():
+    assert FILE_READ_TIMEOUT >= 60
+
+
+async def test_media_client_receives_configured_timeout(monkeypatch):
+    from biliparser.uploader import download as download_module
+
+    captured = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(download_module.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(download_module, "LOCAL_MODE", False)
+    content = ParsedContent(
+        url="https://example.com/post",
+        author=Author(name="tester"),
+        media=MediaInfo(
+            urls=["https://cdn.example.com/image.jpg"],
+            type="image",
+            filenames=["image.jpg"],
+        ),
+    )
+
+    await get_media_for_content(content)
+
+    assert captured["timeout"].read == FILE_READ_TIMEOUT
 
 
 def test_cleanup_medias_paths():

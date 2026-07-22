@@ -15,6 +15,7 @@ import subprocess
 from collections.abc import Callable, Coroutine
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import httpx
@@ -30,9 +31,24 @@ LOCAL_MEDIA_FILE_PATH = Path(os.environ.get("LOCAL_TEMP_FILE_PATH", str(Path.cwd
 LOCAL_MODE = bool(os.environ.get("LOCAL_MODE", False))
 IMAGE_SPLIT_RATIO = float(os.environ.get("IMAGE_SPLIT_RATIO", 2))
 IMAGE_SPLIT_MAX_PIECES = int(os.environ.get("IMAGE_SPLIT_MAX_PIECES", 10))
+FILE_CONNECT_TIMEOUT = float(os.environ.get("FILE_CONNECT_TIMEOUT", 30))
+FILE_READ_TIMEOUT = float(os.environ.get("FILE_READ_TIMEOUT", 60))
+FILE_WRITE_TIMEOUT = float(os.environ.get("FILE_WRITE_TIMEOUT", 60))
+FILE_POOL_TIMEOUT = float(os.environ.get("FILE_POOL_TIMEOUT", 30))
 
 CacheLookup = Callable[[str], Coroutine[None, None, str | None]]
 CacheKeyBuilder = Callable[[str, str | None, Path | str | None, bool], str]
+
+
+def normalize_media_url(url: str) -> str:
+    """Bilibili CDN 的 HTTP 链接统一升级为 HTTPS，避免部分网络环境直连 80 端口超时。"""
+    parsed = urlsplit(url)
+    hostname = parsed.hostname or ""
+    if parsed.scheme == "http" and any(
+        hostname == domain or hostname.endswith(f".{domain}") for domain in ("hdslb.com", "bilivideo.com")
+    ):
+        return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+    return url
 
 
 def cleanup_medias(medias) -> None:
@@ -53,10 +69,12 @@ async def get_media(
     is_thumbnail: bool = False,
     cache_lookup: CacheLookup | None = None,
     cache_key: str | None = None,
+    raise_on_error: bool = False,
 ) -> Path | str | list[Path] | None:
     """下载单个媒体文件到本地临时目录，返回本地 Path 或缓存 file_id"""
     if isinstance(url, Path):
         return url
+    url = normalize_media_url(url)
     if not no_cache and cache_lookup is not None:
         file_id = await cache_lookup(cache_key or filename)
         if file_id:
@@ -127,12 +145,15 @@ async def get_media(
             temp_media.rename(media)
             logger.info(f"完成下载: {media}")
             return media
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as err:
         logger.error(f"下载超时: {url}->{referer}")
-        raise httpx.TimeoutException(f"下载超时: {url}")
+        if raise_on_error:
+            raise httpx.TimeoutException(f"下载超时: {url}") from err
     except Exception as e:
         logger.error(f"下载错误: {url}->{referer}")
         logger.exception(e)
+        if raise_on_error:
+            raise
     finally:
         temp_media.unlink(missing_ok=True)
 
@@ -205,6 +226,11 @@ def expand_long_images(content: ParsedContent, media: list) -> list:
     return new_media
 
 
+def _merged_media_filename(content: ParsedContent) -> str:
+    base_name = content.media.filenames[0] if content.media and content.media.filenames else "merged"
+    return f"{Path(base_name).stem}_merged.mp4"
+
+
 async def handle_dash_media(
     f: ParsedContent,
     client: httpx.AsyncClient,
@@ -213,13 +239,14 @@ async def handle_dash_media(
     document: bool = False,
 ):
     """处理 DASH 视频合并（多轨流下载后用 ffmpeg 合并）"""
-    if not f.media or not f.media.merge_streams or len(f.media.urls) < 2:
+    if not f.media or not f.media.merge_streams:
         return []
+    if len(f.media.urls) < 2:
+        raise httpx.RequestError(f"DASH媒体轨道不足: {f.url}")
     res = []
     try:
         # Use a distinct merged filename to avoid ffmpeg reading and writing the same file
-        base_name = f.media.filenames[0] if f.media.filenames else "merged"
-        merged_name = Path(base_name).stem + "_merged.mp4"
+        merged_name = _merged_media_filename(f)
         cache_dash_file = LOCAL_MEDIA_FILE_PATH / merged_name
 
         if cache_lookup is not None:
@@ -236,13 +263,27 @@ async def handle_dash_media(
                 return [cache_dash]
 
         tasks = [
-            get_media(client, f.url, m, fn, no_cache=True, cache_lookup=cache_lookup)
-            for m, fn in zip(f.media.urls, f.media.filenames, strict=False)
+            get_media(
+                client,
+                f.url,
+                media_url,
+                filename,
+                no_cache=True,
+                cache_lookup=cache_lookup,
+                raise_on_error=True,
+            )
+            for media_url, filename in zip(f.media.urls, f.media.filenames, strict=False)
         ]
-        res = [m for m in await asyncio.gather(*tasks) if m]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = [result for result in results if isinstance(result, Exception)]
+        res = [result for result in results if result and not isinstance(result, BaseException)]
+        if failures:
+            failure = failures[0]
+            if isinstance(failure, httpx.HTTPError):
+                raise failure
+            raise httpx.RequestError(f"DASH媒体下载失败: {f.url}") from failure
         if len(res) < 2:
-            logger.error(f"DASH媒体下载失败: {f.url}")
-            return []
+            raise httpx.RequestError(f"DASH媒体下载不完整: {f.url}")
         cmd = [os.environ.get("FFMPEG_PATH", "ffmpeg"), "-y"]
         for item in res:
             cmd.extend(["-i", str(item)])
@@ -257,7 +298,7 @@ async def handle_dash_media(
         return [cache_dash_file]
     except subprocess.CalledProcessError as e:
         logger.error(f"DASH媒体处理失败: {f.url} - {e!s}")
-        return []
+        raise httpx.RequestError(f"DASH媒体合并失败: {f.url}") from e
     finally:
         for item in res:
             if isinstance(item, Path):
@@ -282,6 +323,12 @@ async def get_media_for_content(
         http2=True,
         follow_redirects=True,
         proxy=os.environ.get("FILE_PROXY", os.environ.get("HTTP_PROXY")),
+        timeout=httpx.Timeout(
+            connect=FILE_CONNECT_TIMEOUT,
+            read=FILE_READ_TIMEOUT,
+            write=FILE_WRITE_TIMEOUT,
+            pool=FILE_POOL_TIMEOUT,
+        ),
     ) as client:
         mediathumb = None
         if f.media.thumbnail:
@@ -306,16 +353,41 @@ async def get_media_for_content(
 
         if f.media.merge_streams:
             # DASH 多轨流必须下载后合并，无论是否 local 模式
-            media = await handle_dash_media(
-                f,
-                client,
-                cache_lookup=cache_lookup,
-                cache_key_builder=cache_key_builder,
-                document=media_check_ignore,
-            )
+            try:
+                media = await handle_dash_media(
+                    f,
+                    client,
+                    cache_lookup=cache_lookup,
+                    cache_key_builder=cache_key_builder,
+                    document=media_check_ignore,
+                )
+            except httpx.HTTPError as err:
+                if not f.media.fallback_url:
+                    raise
+                logger.warning(f"DASH媒体下载失败，改用 MP4 直链: {f.url} - {err}")
+                fallback_url = f.media.fallback_url
+                fallback_filename = _merged_media_filename(f)
+                fallback = await get_media(
+                    client,
+                    f.url,
+                    fallback_url,
+                    fallback_filename,
+                    compression=compression,
+                    media_check_ignore=media_check_ignore,
+                    no_cache=True,
+                    cache_lookup=cache_lookup,
+                    raise_on_error=True,
+                )
+                if not fallback or isinstance(fallback, list):
+                    raise httpx.RequestError(f"MP4 回退媒体下载失败: {f.url}") from err
+                f.media.urls = [fallback_url]
+                f.media.filenames = [fallback_filename]
+                f.media.merge_streams = False
+                media = [fallback]
             if media:
                 return media, mediathumb
         elif f.media.need_download or LOCAL_MODE:
+            required_media = f.media.type in ["video", "audio"]
             tasks = [
                 get_media(
                     client,
@@ -328,10 +400,12 @@ async def get_media_for_content(
                     cache_key=(
                         cache_key_builder(fn, f.media.type, media_url, media_check_ignore) if cache_key_builder else fn
                     ),
+                    raise_on_error=required_media,
                 )
                 for media_url, fn in zip(f.media.urls, f.media.filenames, strict=False)
             ]
-            downloaded = await asyncio.gather(*tasks)
+            downloaded = await asyncio.gather(*tasks, return_exceptions=True)
+            failures = [item for item in downloaded if isinstance(item, Exception)]
             kept_urls: list = []
             kept_filenames: list = []
             media = []
@@ -341,10 +415,15 @@ async def get_media_for_content(
                 f.media.filenames,
                 strict=False,
             ):
-                if item:
+                if item and not isinstance(item, BaseException):
                     media.append(item)
                     kept_urls.append(media_url)
                     kept_filenames.append(filename)
+            if required_media and (failures or not media):
+                cleanup_medias(media)
+                if failures:
+                    raise failures[0]
+                raise httpx.RequestError(f"媒体下载失败: {f.url}")
             f.media.urls = kept_urls
             f.media.filenames = kept_filenames
             media = expand_long_images(f, media)
