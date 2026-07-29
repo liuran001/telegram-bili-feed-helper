@@ -18,7 +18,7 @@ import httpx
 from ..model import MediaConstraints, ParsedContent
 from ..provider import ProviderRegistry
 from ..provider.bilibili.api import CACHES_TIMER
-from ..storage.cache import RedisCache
+from ..storage.cache import RedisCache, upload_lock_key
 from ..utils import logger
 from .download import cleanup_medias, get_media_for_content
 
@@ -232,7 +232,7 @@ class UploadQueueManager(ABC):
                 logger.info(f"任务 {task.task_id[:8]} 上传成功 (尝试 {attempt}/{max_retries})")
                 return True
 
-            async with RedisCache().lock(f.url, timeout=2 * CACHES_TIMER["LOCK"]):
+            async with RedisCache().lock(upload_lock_key(f.url), timeout=2 * CACHES_TIMER["LOCK"]):
                 media, mediathumb = await get_media_for_content(
                     f,
                     cache_lookup=self._cache_lookup,

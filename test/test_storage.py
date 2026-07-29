@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from biliparser.storage.cache import FakeLock, FakeRedis, RedisCache
+from biliparser.storage.cache import (
+    UPLOAD_LOCK_PREFIX,
+    FakeLock,
+    FakeRedis,
+    RedisCache,
+    clear_stale_upload_locks,
+    upload_lock_key,
+)
 from biliparser.storage.models import TelegramFileCache
 
 
@@ -150,3 +157,71 @@ class TestTelegramFileCache:
         assert "mediafilename" in field_names
         assert "file_id" in field_names
         assert "created" in field_names
+
+
+class TestStaleUploadLockCleanup:
+    """进程被杀后遗留的下载锁 — 锁 TTL 长达 2 小时，不清理会让同 URL 的新任务一直阻塞"""
+
+    def test_lock_key_is_namespaced(self):
+        """锁 key 需带前缀，才能与同库的缓存 key 区分开、安全批量清理"""
+        key = upload_lock_key("https://www.bilibili.com/video/av123?p=1")
+        assert key.startswith(UPLOAD_LOCK_PREFIX)
+        assert key.endswith("https://www.bilibili.com/video/av123?p=1")
+
+    async def test_clears_only_stale_upload_locks(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("biliparser.storage.cache.LOCAL_FILE_PATH", tmp_path)
+        store = FakeRedis()
+        store.cache = {}
+        await store.set(upload_lock_key("https://www.bilibili.com/video/av1"), "1")
+        await store.set(upload_lock_key("https://www.bilibili.com/video/av2"), "1")
+        await store.set("video:aid:12345", "payload")
+        await store.set("new_reply:12345:1", "payload")
+
+        cleared = await clear_stale_upload_locks(store)
+
+        assert cleared == 2
+        assert await store.get("video:aid:12345") == "payload"
+        assert await store.get("new_reply:12345:1") == "payload"
+        assert await store.get(upload_lock_key("https://www.bilibili.com/video/av1")) is None
+        assert await store.get(upload_lock_key("https://www.bilibili.com/video/av2")) is None
+
+    async def test_no_locks_is_a_noop(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("biliparser.storage.cache.LOCAL_FILE_PATH", tmp_path)
+        store = FakeRedis()
+        store.cache = {}
+        await store.set("video:aid:1", "x")
+        assert await clear_stale_upload_locks(store) == 0
+        assert await store.get("video:aid:1") == "x"
+
+    async def test_released_lock_leaves_nothing_to_clear(self, tmp_path, monkeypatch):
+        """正常释放的锁不该在启动时被统计为孤儿"""
+        monkeypatch.setattr("biliparser.storage.cache.LOCAL_FILE_PATH", tmp_path)
+        store = FakeRedis()
+        store.cache = {}
+        async with store.lock(upload_lock_key("https://www.bilibili.com/video/av9"), timeout=60):
+            assert await clear_stale_upload_locks(store) == 1  # 持锁期间可见
+        assert await clear_stale_upload_locks(store) == 0
+
+    async def test_cleanup_failure_does_not_block_startup(self):
+        """清理挂在 db_init 里，Redis 异常绝不能拖垮启动"""
+
+        class BrokenStore:
+            def scan_iter(self, match):
+                raise ConnectionError("redis down")
+
+        assert await clear_stale_upload_locks(BrokenStore()) == 0
+
+    async def test_cleanup_handles_bytes_keys(self, tmp_path, monkeypatch):
+        """真实 redis-py 不开 decode_responses 时 scan_iter 产出 bytes"""
+        monkeypatch.setattr("biliparser.storage.cache.LOCAL_FILE_PATH", tmp_path)
+        deleted: list = []
+
+        class BytesStore:
+            async def scan_iter(self, match):
+                yield upload_lock_key("https://www.bilibili.com/video/av1").encode()
+
+            async def delete(self, key):
+                deleted.append(key)
+
+        assert await clear_stale_upload_locks(BytesStore()) == 1
+        assert deleted == [upload_lock_key("https://www.bilibili.com/video/av1")]

@@ -19,7 +19,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter
 
 from ...model import MediaConstraints, ParsedContent
 from ...provider.bilibili.api import CACHES_TIMER
-from ...storage.cache import RedisCache
+from ...storage.cache import RedisCache, upload_lock_key
 from ...storage.models import TelegramFileCache
 from ...uploader.download import (
     cleanup_medias,
@@ -277,7 +277,7 @@ class TelegramUploadQueueManager(UploadQueueManager):
         caption = format_caption_for_telegram(f, self.constraints)
         medias = []
         try:
-            async with RedisCache().lock(f.url, timeout=CACHES_TIMER["LOCK"]):
+            async with RedisCache().lock(upload_lock_key(f.url), timeout=CACHES_TIMER["LOCK"]):
                 medias, mediathumb = await get_media_for_content(
                     f,
                     compression=False,

@@ -6,7 +6,7 @@ from tortoise import Tortoise
 from tortoise.context import TortoiseContext
 
 from ..utils import logger
-from .cache import LOCAL_FILE_PATH
+from .cache import LOCAL_FILE_PATH, clear_stale_upload_locks
 
 
 @contextmanager
@@ -40,6 +40,8 @@ async def db_init() -> None:
         use_tz=True,
     )
     await Tortoise.generate_schemas()
+    # Redis 独立于本进程存活，上次异常退出遗留的媒体处理锁会跨重启阻塞同 URL 的新任务
+    await clear_stale_upload_locks()
 
 
 async def db_close() -> None:
