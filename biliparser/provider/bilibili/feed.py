@@ -20,6 +20,26 @@ from .api import (
 )
 
 
+def upos_mirror_domains() -> list[str]:
+    """``UPOS_DOMAIN`` 配置的镜像域名列表。"""
+    return [domain.strip() for domain in os.environ.get("UPOS_DOMAIN", "").split(",") if domain.strip()]
+
+
+def expand_upos_urls(urls: list[str], domains: list[str] | None = None) -> list[str]:
+    """把每个源 URL 按 UPOS 镜像域名展开，原生 URL 保留在末尾兜底。
+
+    B站对境外 IP 只返回 ov/akam 等境外节点，这些节点在边缘缓存未命中时要跨境回源，
+    实测比境内镜像慢一个数量级（甚至直接 403）。把镜像全部展开进候选池，
+    才能让下载层的测速在境内外节点之间真正择优。
+    """
+    source_urls = [url for url in urls if url]
+    domains = upos_mirror_domains() if domains is None else domains
+    if not domains:
+        return list(dict.fromkeys(source_urls))
+    expanded = [re.sub(r"https?://[^/]+/", f"https://{domain}/", url) for url in source_urls for domain in domains]
+    return list(dict.fromkeys([*expanded, *source_urls]))
+
+
 class Feed(ABC):
     user: str = ""
     uid: str = ""
@@ -50,15 +70,9 @@ class Feed(ABC):
         header = BILIBILI_DESKTOP_HEADER.copy()
         header["Referer"] = referer
         source_urls = [url] if isinstance(url, str) else list(url)
-        select_urls = []
-        upos_domain = os.environ.get("UPOS_DOMAIN")
-        if upos_domain:
-            domains = [domain.strip() for domain in upos_domain.split(",") if domain.strip()]
-            random.shuffle(domains)
-            for source_url in source_urls:
-                select_urls.extend(re.sub(r"https?://[^/]+/", f"https://{domain}/", source_url) for domain in domains)
-        select_urls.extend(source_urls)
-        select_urls = list(dict.fromkeys(select_urls))
+        domains = upos_mirror_domains()
+        random.shuffle(domains)
+        select_urls = expand_upos_urls(source_urls, domains)
         for select_url in select_urls:
             try:
                 select_url = re.sub(r"&buvid=[^&]+", "&buvid=", select_url)  ## 清除buvid参数

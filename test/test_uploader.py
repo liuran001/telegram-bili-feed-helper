@@ -25,6 +25,7 @@ from biliparser.channel.telegram.uploader import (
 from biliparser.model import Author, MediaConstraints, MediaInfo, ParsedContent
 from biliparser.provider import ProviderRegistry
 from biliparser.storage.models import TelegramFileCache
+from biliparser.uploader import download as download_module
 from biliparser.uploader.download import (
     FILE_READ_TIMEOUT,
     cleanup_medias,
@@ -124,6 +125,7 @@ async def test_upos_candidates_are_ranked_by_parallel_range_probe():
             ["https://slow.example/video.m4s", "https://fast.example/video.m4s"],
             probe_bytes=1024,
             probe_timeout=1,
+            probe_offset=0,
         )
 
     assert ranked == ["https://fast.example/video.m4s", "https://slow.example/video.m4s"]
@@ -152,6 +154,7 @@ async def test_shared_semaphore_caps_parallel_upos_probes():
                 ["https://v1.example/v.m4s", "https://v2.example/v.m4s"],
                 probe_bytes=16,
                 probe_timeout=1,
+                probe_offset=0,
                 semaphore=semaphore,
             ),
             rank_media_urls(
@@ -160,6 +163,7 @@ async def test_shared_semaphore_caps_parallel_upos_probes():
                 ["https://a1.example/a.m4s", "https://a2.example/a.m4s"],
                 probe_bytes=16,
                 probe_timeout=1,
+                probe_offset=0,
                 semaphore=semaphore,
             ),
         )
@@ -1219,3 +1223,58 @@ async def test_empty_video_urls_fall_back_to_caption(monkeypatch):
 
     assert await _manager()._try_upload_once(task, attempt=1, max_retries=1) is True
     message.reply_text.assert_awaited_once()
+
+
+async def test_probe_measures_past_cdn_hot_head_region():
+    """测速必须避开文件开头。
+
+    CDN 边缘常只缓存了文件开头，从 bytes=0 取小样本会量到缓存命中的速度而非回源速度。
+    线上实证：akamai 节点 2MiB 探测报 9.9 MiB/s，实际整段下载只有 0.5 MiB/s。
+    """
+    seen: list[str] = []
+
+    async def probe(request):
+        seen.append(request.headers["Range"])
+        return httpx.Response(206, stream=_AsyncBytesStream(b"x" * 4096))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
+        await rank_media_urls(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            ["https://a.example/v.m4s", "https://b.example/v.m4s"],
+            probe_bytes=4096,
+            probe_timeout=1,
+            probe_offset=1024 * 1024,
+        )
+
+    assert seen and all(r == f"bytes={1024 * 1024}-{1024 * 1024 + 4095}" for r in seen), seen
+
+
+async def test_probe_falls_back_to_head_when_offset_exceeds_file():
+    """小于偏移量的文件会返回 416，此时必须回退到开头重测，否则候选被误判为不可用"""
+    seen: list[str] = []
+
+    async def probe(request):
+        seen.append(request.headers["Range"])
+        if request.headers["Range"].startswith("bytes=1048576-"):
+            return httpx.Response(416, stream=_AsyncBytesStream(b""))
+        return httpx.Response(206, stream=_AsyncBytesStream(b"x" * 4096))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
+        ranked = await rank_media_urls(
+            client,
+            "https://www.bilibili.com/video/BV1test",
+            ["https://small.example/v.m4s", "https://other.example/v.m4s"],
+            probe_bytes=4096,
+            probe_timeout=1,
+            probe_offset=1024 * 1024,
+        )
+
+    assert "bytes=0-4095" in seen, seen
+    assert "https://small.example/v.m4s" in ranked
+
+
+def test_probe_sample_is_large_enough_to_outlast_cdn_burst():
+    """默认探测样本需足够大，2MiB 会被 CDN 边缘缓存/TCP 突发带偏"""
+    assert download_module.UPOS_PROBE_BYTES >= 8 * 1024 * 1024
+    assert download_module.UPOS_PROBE_OFFSET > 0

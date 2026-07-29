@@ -39,7 +39,8 @@ FILE_CONNECT_TIMEOUT = float(os.environ.get("FILE_CONNECT_TIMEOUT", 30))
 FILE_READ_TIMEOUT = float(os.environ.get("FILE_READ_TIMEOUT", 60))
 FILE_WRITE_TIMEOUT = float(os.environ.get("FILE_WRITE_TIMEOUT", 60))
 FILE_POOL_TIMEOUT = float(os.environ.get("FILE_POOL_TIMEOUT", 30))
-UPOS_PROBE_BYTES = int(os.environ.get("UPOS_PROBE_BYTES", 2 * 1024 * 1024))
+UPOS_PROBE_BYTES = int(os.environ.get("UPOS_PROBE_BYTES", 8 * 1024 * 1024))
+UPOS_PROBE_OFFSET = int(os.environ.get("UPOS_PROBE_OFFSET", 16 * 1024 * 1024))
 UPOS_PROBE_TIMEOUT = float(os.environ.get("UPOS_PROBE_TIMEOUT", 10))
 DOWNLOAD_PROGRESS_INTERVAL = float(os.environ.get("DOWNLOAD_PROGRESS_INTERVAL", 15))
 FILE_RANGE_WORKERS = int(os.environ.get("FILE_RANGE_WORKERS", 4))
@@ -240,30 +241,44 @@ async def _probe_media_url(
     probe_bytes: int,
     probe_timeout: float,
     semaphore: asyncio.Semaphore | None = None,
+    probe_offset: int = UPOS_PROBE_OFFSET,
 ) -> tuple[str, float] | None:
     header = BILIBILI_DESKTOP_HEADER.copy()
     header["Referer"] = referer
-    header["Range"] = f"bytes=0-{probe_bytes - 1}"
     header["Accept-Encoding"] = "identity"
     downloaded = 0
     started = time.monotonic()
 
-    async def probe() -> None:
-        nonlocal downloaded
-        async with timeout(probe_timeout), client.stream("GET", url, headers=header) as response:
+    async def probe(offset: int) -> bool:
+        """返回 True 表示偏移越过文件末尾，需要回退到开头重测。"""
+        nonlocal downloaded, started
+        request_header = header.copy()
+        request_header["Range"] = f"bytes={offset}-{offset + probe_bytes - 1}"
+        downloaded = 0
+        started = time.monotonic()
+        async with timeout(probe_timeout), client.stream("GET", url, headers=request_header) as response:
+            if response.status_code == 416:
+                return offset > 0
             if response.status_code not in (200, 206):
-                return
+                return False
             async for chunk in response.aiter_raw():
                 downloaded += len(chunk)
                 if downloaded >= probe_bytes:
                     break
+        return False
+
+    async def run() -> None:
+        # 从文件中段取样：CDN 边缘常只缓存了开头，从 bytes=0 测会量到缓存命中速度而非
+        # 回源速度，导致跨境慢节点被误判为最快候选。小文件触发 416 时回退到开头。
+        if await probe(max(0, probe_offset)):
+            await probe(0)
 
     try:
         if semaphore:
             async with semaphore:
-                await probe()
+                await run()
         else:
-            await probe()
+            await run()
     except asyncio.TimeoutError:
         pass
     except httpx.HTTPError:
@@ -282,6 +297,7 @@ async def rank_media_urls(
     *,
     probe_bytes: int = UPOS_PROBE_BYTES,
     probe_timeout: float = UPOS_PROBE_TIMEOUT,
+    probe_offset: int = UPOS_PROBE_OFFSET,
     semaphore: asyncio.Semaphore | None = None,
 ) -> list[str]:
     """并发小范围测速，成功候选按实际吞吐排序，探测失败候选保留在末尾供兜底。"""
@@ -290,7 +306,10 @@ async def rank_media_urls(
         return candidates
 
     results = await asyncio.gather(
-        *(_probe_media_url(client, referer, url, probe_bytes, probe_timeout, semaphore) for url in candidates)
+        *(
+            _probe_media_url(client, referer, url, probe_bytes, probe_timeout, semaphore, probe_offset)
+            for url in candidates
+        )
     )
     speeds = {result[0]: result[1] for result in results if result is not None}
     if not speeds:

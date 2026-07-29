@@ -20,7 +20,7 @@ from .api import (
     bili_api_request,
 )
 from .credential import credentialFactory
-from .feed import Feed
+from .feed import Feed, expand_upos_urls
 
 _DEFAULT_MAX_SIZE = 50 * 1024 * 1024  # 50MB
 _VIDEO_CODEC_ALIASES = {
@@ -89,7 +89,8 @@ def _dash_stream_candidates(dash_data: dict, selected_stream, kind: str) -> list
 
 
 def _prioritize_url(selected: str, candidates: list[str]) -> list[str]:
-    return _dedupe_urls([selected, *candidates])
+    """选中的 URL 置顶，其余 UPOS 镜像与原生候选跟随其后供下载层测速择优。"""
+    return _dedupe_urls([selected, *expand_upos_urls(candidates)])
 
 
 class Video(Feed):
