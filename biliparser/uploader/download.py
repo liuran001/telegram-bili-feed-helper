@@ -40,7 +40,6 @@ FILE_READ_TIMEOUT = float(os.environ.get("FILE_READ_TIMEOUT", 60))
 FILE_WRITE_TIMEOUT = float(os.environ.get("FILE_WRITE_TIMEOUT", 60))
 FILE_POOL_TIMEOUT = float(os.environ.get("FILE_POOL_TIMEOUT", 30))
 UPOS_PROBE_BYTES = int(os.environ.get("UPOS_PROBE_BYTES", 8 * 1024 * 1024))
-UPOS_PROBE_OFFSET = int(os.environ.get("UPOS_PROBE_OFFSET", 16 * 1024 * 1024))
 UPOS_PROBE_TIMEOUT = float(os.environ.get("UPOS_PROBE_TIMEOUT", 10))
 DOWNLOAD_PROGRESS_INTERVAL = float(os.environ.get("DOWNLOAD_PROGRESS_INTERVAL", 15))
 FILE_RANGE_WORKERS = int(os.environ.get("FILE_RANGE_WORKERS", 4))
@@ -241,7 +240,6 @@ async def _probe_media_url(
     probe_bytes: int,
     probe_timeout: float,
     semaphore: asyncio.Semaphore | None = None,
-    probe_offset: int = UPOS_PROBE_OFFSET,
 ) -> tuple[str, float] | None:
     header = BILIBILI_DESKTOP_HEADER.copy()
     header["Referer"] = referer
@@ -249,18 +247,18 @@ async def _probe_media_url(
     downloaded = 0
     started = time.monotonic()
 
-    async def probe(offset: int) -> bool:
-        """返回 True 表示偏移越过文件末尾，需要回退到开头重测。"""
+    async def probe(range_header: str) -> bool:
+        """返回 True 表示该范围被拒绝，需要回退到文件开头重测。"""
         nonlocal downloaded, started
         request_header = header.copy()
-        request_header["Range"] = f"bytes={offset}-{offset + probe_bytes - 1}"
+        request_header["Range"] = range_header
         downloaded = 0
         started = time.monotonic()
         async with timeout(probe_timeout), client.stream("GET", url, headers=request_header) as response:
-            if response.status_code == 416:
-                return offset > 0
+            # 各家 CDN 拒绝后缀范围的状态码不统一（实测 upcdnbda2 返回 400、越界是 416），
+            # 一律回退重试，避免把可用镜像误判成死节点。
             if response.status_code not in (200, 206):
-                return False
+                return True
             async for chunk in response.aiter_raw():
                 downloaded += len(chunk)
                 if downloaded >= probe_bytes:
@@ -268,10 +266,11 @@ async def _probe_media_url(
         return False
 
     async def run() -> None:
-        # 从文件中段取样：CDN 边缘常只缓存了开头，从 bytes=0 测会量到缓存命中速度而非
-        # 回源速度，导致跨境慢节点被误判为最快候选。小文件触发 416 时回退到开头。
-        if await probe(max(0, probe_offset)):
-            await probe(0)
+        # 用后缀范围量文件末尾：CDN 边缘缓存的是此前被下载过的前段，热区能有几十 MiB，
+        # 固定偏移挡不住（实测偏移 16 MiB 仍报 116 MiB/s，真实回源只有 0.6）。
+        # 末尾极少被下载触及，且后缀范围不需要预先知道文件大小。
+        if await probe(f"bytes=-{probe_bytes}"):
+            await probe(f"bytes=0-{probe_bytes - 1}")
 
     try:
         if semaphore:
@@ -297,7 +296,6 @@ async def rank_media_urls(
     *,
     probe_bytes: int = UPOS_PROBE_BYTES,
     probe_timeout: float = UPOS_PROBE_TIMEOUT,
-    probe_offset: int = UPOS_PROBE_OFFSET,
     semaphore: asyncio.Semaphore | None = None,
 ) -> list[str]:
     """并发小范围测速，成功候选按实际吞吐排序，探测失败候选保留在末尾供兜底。"""
@@ -306,10 +304,7 @@ async def rank_media_urls(
         return candidates
 
     results = await asyncio.gather(
-        *(
-            _probe_media_url(client, referer, url, probe_bytes, probe_timeout, semaphore, probe_offset)
-            for url in candidates
-        )
+        *(_probe_media_url(client, referer, url, probe_bytes, probe_timeout, semaphore) for url in candidates)
     )
     speeds = {result[0]: result[1] for result in results if result is not None}
     if not speeds:

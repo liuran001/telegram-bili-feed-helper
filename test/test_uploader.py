@@ -114,7 +114,7 @@ async def test_required_media_download_propagates_httpx_timeout():
 
 async def test_upos_candidates_are_ranked_by_parallel_range_probe():
     async def probe(request):
-        assert request.headers["Range"] == "bytes=0-1023"
+        assert request.headers["Range"] == "bytes=-1024"
         await asyncio.sleep(0.005 if request.url.host == "fast.example" else 0.05)
         return httpx.Response(206, stream=_AsyncBytesStream(b"x" * 1024))
 
@@ -125,7 +125,6 @@ async def test_upos_candidates_are_ranked_by_parallel_range_probe():
             ["https://slow.example/video.m4s", "https://fast.example/video.m4s"],
             probe_bytes=1024,
             probe_timeout=1,
-            probe_offset=0,
         )
 
     assert ranked == ["https://fast.example/video.m4s", "https://slow.example/video.m4s"]
@@ -154,7 +153,6 @@ async def test_shared_semaphore_caps_parallel_upos_probes():
                 ["https://v1.example/v.m4s", "https://v2.example/v.m4s"],
                 probe_bytes=16,
                 probe_timeout=1,
-                probe_offset=0,
                 semaphore=semaphore,
             ),
             rank_media_urls(
@@ -163,7 +161,6 @@ async def test_shared_semaphore_caps_parallel_upos_probes():
                 ["https://a1.example/a.m4s", "https://a2.example/a.m4s"],
                 probe_bytes=16,
                 probe_timeout=1,
-                probe_offset=0,
                 semaphore=semaphore,
             ),
         )
@@ -1225,11 +1222,13 @@ async def test_empty_video_urls_fall_back_to_caption(monkeypatch):
     message.reply_text.assert_awaited_once()
 
 
-async def test_probe_measures_past_cdn_hot_head_region():
-    """测速必须避开文件开头。
+async def test_probe_measures_tail_to_dodge_cdn_cached_head():
+    """测速必须量文件末尾。
 
-    CDN 边缘常只缓存了文件开头，从 bytes=0 取小样本会量到缓存命中的速度而非回源速度。
-    线上实证：akamai 节点 2MiB 探测报 9.9 MiB/s，实际整段下载只有 0.5 MiB/s。
+    CDN 边缘缓存的是**已被下载过的前段**，热区大小取决于此前下过多少，固定偏移挡不住：
+    线上实测一次中断的下载把前 80 MiB 灌进了 akamai 边缘，偏移 16 MiB 的探测仍报
+    42-116 MiB/s，而真正下到未缓存区只有 0.6 MiB/s。后缀范围不需要知道文件大小，
+    且下载极少触及末尾，是最不容易被污染的取样点。
     """
     seen: list[str] = []
 
@@ -1244,20 +1243,24 @@ async def test_probe_measures_past_cdn_hot_head_region():
             ["https://a.example/v.m4s", "https://b.example/v.m4s"],
             probe_bytes=4096,
             probe_timeout=1,
-            probe_offset=1024 * 1024,
         )
 
-    assert seen and all(r == f"bytes={1024 * 1024}-{1024 * 1024 + 4095}" for r in seen), seen
+    assert seen and all(r == "bytes=-4096" for r in seen), seen
 
 
-async def test_probe_falls_back_to_head_when_offset_exceeds_file():
-    """小于偏移量的文件会返回 416，此时必须回退到开头重测，否则候选被误判为不可用"""
+@pytest.mark.parametrize("reject_status", [416, 400, 501])
+async def test_probe_falls_back_to_head_when_suffix_range_unsupported(reject_status):
+    """CDN 拒绝后缀范围时回退到开头，否则好节点被误判为不可用。
+
+    各家 CDN 的拒绝码并不统一：线上 upos-sz-upcdnbda2 对 `bytes=-N` 返回 400 而非 416，
+    只认 416 会把一个 5.8 MiB/s 的可用镜像判成死节点。
+    """
     seen: list[str] = []
 
     async def probe(request):
         seen.append(request.headers["Range"])
-        if request.headers["Range"].startswith("bytes=1048576-"):
-            return httpx.Response(416, stream=_AsyncBytesStream(b""))
+        if request.headers["Range"].startswith("bytes=-"):
+            return httpx.Response(reject_status, stream=_AsyncBytesStream(b""))
         return httpx.Response(206, stream=_AsyncBytesStream(b"x" * 4096))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
@@ -1267,7 +1270,6 @@ async def test_probe_falls_back_to_head_when_offset_exceeds_file():
             ["https://small.example/v.m4s", "https://other.example/v.m4s"],
             probe_bytes=4096,
             probe_timeout=1,
-            probe_offset=1024 * 1024,
         )
 
     assert "bytes=0-4095" in seen, seen
@@ -1277,4 +1279,3 @@ async def test_probe_falls_back_to_head_when_offset_exceeds_file():
 def test_probe_sample_is_large_enough_to_outlast_cdn_burst():
     """默认探测样本需足够大，2MiB 会被 CDN 边缘缓存/TCP 突发带偏"""
     assert download_module.UPOS_PROBE_BYTES >= 8 * 1024 * 1024
-    assert download_module.UPOS_PROBE_OFFSET > 0

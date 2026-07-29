@@ -151,3 +151,24 @@ class TestUposMirrorExpansion:
         monkeypatch.setenv("UPOS_DOMAIN", " , ,")
         urls = ["https://upos-sz-mirrorcosov.bilivideo.com/a.m4s"]
         assert expand_upos_urls(urls) == urls
+
+    def test_each_mirror_appears_once_across_multiple_sources(self, monkeypatch):
+        """多个原生源展开时每个镜像只保留一份。
+
+        B站的 baseUrl 与 backupUrl 域名不同、query 签名也不同，逐一展开会让同一个
+        镜像域名出现两次（线上实测测速列表里每个境内镜像都被探测了两遍，白白翻倍）。
+        """
+        monkeypatch.setenv("UPOS_DOMAIN", "m1.bilivideo.com,m2.bilivideo.com")
+        native = [
+            "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/a.m4s?os=cosovbv&upsig=aaa",
+            "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/a.m4s?os=akam&upsig=bbb",
+        ]
+
+        result = expand_upos_urls(native)
+        hosts = [httpx.URL(url).host for url in result]
+
+        assert hosts.count("m1.bilivideo.com") == 1
+        assert hosts.count("m2.bilivideo.com") == 1
+        assert hosts == ["m1.bilivideo.com", "m2.bilivideo.com", *[httpx.URL(u).host for u in native]]
+        # 镜像沿用第一个源的签名，兜底仍是两个原生 URL
+        assert result[0] == "https://m1.bilivideo.com/upgcxcode/a.m4s?os=cosovbv&upsig=aaa"

@@ -26,17 +26,20 @@ def upos_mirror_domains() -> list[str]:
 
 
 def expand_upos_urls(urls: list[str], domains: list[str] | None = None) -> list[str]:
-    """把每个源 URL 按 UPOS 镜像域名展开，原生 URL 保留在末尾兜底。
+    """把源 URL 按 UPOS 镜像域名展开，原生 URL 保留在末尾兜底。
 
     B站对境外 IP 只返回 ov/akam 等境外节点，这些节点在边缘缓存未命中时要跨境回源，
     实测比境内镜像慢一个数量级（甚至直接 403）。把镜像全部展开进候选池，
     才能让下载层的测速在境内外节点之间真正择优。
+
+    UPOS 签名在 query 上且各镜像通用，因此每个镜像域名只沿用第一个源的 path+query
+    展开一份——逐个源展开会让同一域名重复出现，白白翻倍测速开销。
     """
-    source_urls = [url for url in urls if url]
+    source_urls = list(dict.fromkeys(url for url in urls if url))
     domains = upos_mirror_domains() if domains is None else domains
-    if not domains:
-        return list(dict.fromkeys(source_urls))
-    expanded = [re.sub(r"https?://[^/]+/", f"https://{domain}/", url) for url in source_urls for domain in domains]
+    if not domains or not source_urls:
+        return source_urls
+    expanded = [re.sub(r"https?://[^/]+/", f"https://{domain}/", source_urls[0]) for domain in domains]
     return list(dict.fromkeys([*expanded, *source_urls]))
 
 
